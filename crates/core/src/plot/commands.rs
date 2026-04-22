@@ -4,6 +4,9 @@ use crate::plot::data::sleep_time_for_tps;
 use crate::profile::PlayerProfile;
 use crate::server::{get_version_string, Message};
 use mchprs_blocks::items::ItemStack;
+use mchprs_blocks::BlockPos;
+use mchprs_schematic::parse_block;
+use mchprs_world::World;
 use mchprs_network::packets::clientbound::{
     CCommands, CCommandsNode as Node, CDeclareCommandsNodeParser as Parser, ClientBoundPacket,
 };
@@ -523,6 +526,108 @@ impl Plot {
             "version" => {
                 self.players[player].send_system_message(&get_version_string());
             }
+            "setblock" => {
+                if args.len() < 4 {
+                    self.players[player]
+                        .send_error_message("Usage: /setblock <x> <y> <z> <block>");
+                    return false;
+                }
+                let player_pos = self.players[player].pos;
+                let x = match parse_relative_coord::<i32>(args[0], player_pos.x as i32) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        self.players[player].send_error_message("Unable to parse x coordinate!");
+                        return false;
+                    }
+                };
+                let y = match parse_relative_coord::<i32>(args[1], player_pos.y as i32) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        self.players[player].send_error_message("Unable to parse y coordinate!");
+                        return false;
+                    }
+                };
+                let z = match parse_relative_coord::<i32>(args[2], player_pos.z as i32) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        self.players[player].send_error_message("Unable to parse z coordinate!");
+                        return false;
+                    }
+                };
+                let PlotWorld { x: plot_x, z: plot_z, .. } = self.world;
+                if !Plot::in_plot_bounds(plot_x, plot_z, x, z) {
+                    self.players[player]
+                        .send_error_message("Position is outside of the current plot!");
+                    return false;
+                }
+                let block = match parse_block(args[3]) {
+                    Some(b) => b,
+                    None => {
+                        self.players[player].send_error_message("Unknown block!");
+                        return false;
+                    }
+                };
+                let pos = BlockPos::new(x, y, z);
+                self.world.set_block_raw(pos, block.get_id());
+                self.world.flush_block_changes();
+            }
+            "fill" => {
+                if args.len() < 7 {
+                    self.players[player]
+                        .send_error_message("Usage: /fill <x1> <y1> <z1> <x2> <y2> <z2> <block>");
+                    return false;
+                }
+                let player_pos = self.players[player].pos;
+                macro_rules! parse_coord {
+                    ($arg:expr, $ref:expr, $label:literal) => {
+                        match parse_relative_coord::<i32>($arg, $ref) {
+                            Ok(v) => v,
+                            Err(_) => {
+                                self.players[player].send_error_message(
+                                    concat!("Unable to parse ", $label, " coordinate!"),
+                                );
+                                return false;
+                            }
+                        }
+                    };
+                }
+                let x1 = parse_coord!(args[0], player_pos.x as i32, "x1");
+                let y1 = parse_coord!(args[1], player_pos.y as i32, "y1");
+                let z1 = parse_coord!(args[2], player_pos.z as i32, "z1");
+                let x2 = parse_coord!(args[3], player_pos.x as i32, "x2");
+                let y2 = parse_coord!(args[4], player_pos.y as i32, "y2");
+                let z2 = parse_coord!(args[5], player_pos.z as i32, "z2");
+                let PlotWorld { x: plot_x, z: plot_z, .. } = self.world;
+                if !Plot::in_plot_bounds(plot_x, plot_z, x1, z1)
+                    || !Plot::in_plot_bounds(plot_x, plot_z, x2, z2)
+                {
+                    self.players[player]
+                        .send_error_message("Fill region is outside of the current plot!");
+                    return false;
+                }
+                let block = match parse_block(args[6]) {
+                    Some(b) => b,
+                    None => {
+                        self.players[player].send_error_message("Unknown block!");
+                        return false;
+                    }
+                };
+                let block_id = block.get_id();
+                let min_x = x1.min(x2);
+                let max_x = x1.max(x2);
+                let min_y = y1.min(y2);
+                let max_y = y1.max(y2);
+                let min_z = z1.min(z2);
+                let max_z = z1.max(z2);
+                for y in min_y..=max_y {
+                    for z in min_z..=max_z {
+                        for x in min_x..=max_x {
+                            self.world.set_block_raw(BlockPos::new(x, y, z), block_id);
+                        }
+                    }
+                }
+                self.world.flush_block_changes();
+            }
             _ => self.players[player].send_error_message("Command not found!"),
         }
         false
@@ -551,7 +656,7 @@ pub static DECLARE_COMMANDS: LazyLock<PacketEncoder> = LazyLock::new(|| {
             Node {
                 flags: CommandFlags::ROOT.bits() as i8,
                 children: vec![
-                    1, 4, 5, 6, 8, 10, 11, 13, 18, 30, 34, 41, 43, 44, 45, 49, 51, 52,
+                    1, 4, 5, 6, 8, 10, 11, 13, 18, 30, 34, 41, 43, 44, 45, 49, 51, 52, 53, 56,
                 ],
                 redirect_node: None,
                 name: None,
@@ -1027,6 +1132,69 @@ pub static DECLARE_COMMANDS: LazyLock<PacketEncoder> = LazyLock::new(|| {
                 redirect_node: None,
                 name: Some("version"),
                 parser: None,
+                suggestions_type: None,
+            },
+            // 53: /setblock
+            Node {
+                flags: CommandFlags::LITERAL.bits() as i8,
+                children: vec![54],
+                redirect_node: None,
+                name: Some("setblock"),
+                parser: None,
+                suggestions_type: None,
+            },
+            // 54: /setblock <pos>
+            Node {
+                flags: CommandFlags::ARGUMENT.bits() as i8,
+                children: vec![55],
+                redirect_node: None,
+                name: Some("pos"),
+                parser: Some(Parser::Vec3),
+                suggestions_type: None,
+            },
+            // 55: /setblock <pos> <block>
+            Node {
+                flags: (CommandFlags::ARGUMENT | CommandFlags::EXECUTABLE).bits() as i8,
+                children: vec![],
+                redirect_node: None,
+                name: Some("block"),
+                parser: Some(Parser::String(0)),
+                suggestions_type: None,
+            },
+            // 56: /fill
+            Node {
+                flags: CommandFlags::LITERAL.bits() as i8,
+                children: vec![57],
+                redirect_node: None,
+                name: Some("fill"),
+                parser: None,
+                suggestions_type: None,
+            },
+            // 57: /fill <from>
+            Node {
+                flags: CommandFlags::ARGUMENT.bits() as i8,
+                children: vec![58],
+                redirect_node: None,
+                name: Some("from"),
+                parser: Some(Parser::Vec3),
+                suggestions_type: None,
+            },
+            // 58: /fill <from> <to>
+            Node {
+                flags: CommandFlags::ARGUMENT.bits() as i8,
+                children: vec![59],
+                redirect_node: None,
+                name: Some("to"),
+                parser: Some(Parser::Vec3),
+                suggestions_type: None,
+            },
+            // 59: /fill <from> <to> <block>
+            Node {
+                flags: (CommandFlags::ARGUMENT | CommandFlags::EXECUTABLE).bits() as i8,
+                children: vec![],
+                redirect_node: None,
+                name: Some("block"),
+                parser: Some(Parser::String(0)),
                 suggestions_type: None,
             },
         ],

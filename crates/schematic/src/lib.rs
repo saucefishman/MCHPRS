@@ -127,7 +127,7 @@ macro_rules! nbt_as {
     };
 }
 
-fn parse_block(str: &str) -> Option<Block> {
+pub fn parse_block(str: &str) -> Option<Block> {
     static RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?:minecraft:)?([a-z_]+)(?:\[([a-z=,0-9]+)\])?").unwrap());
     let captures = RE.captures(str)?;
