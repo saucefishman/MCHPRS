@@ -1,3 +1,4 @@
+use super::watch::SchematicWatch;
 use super::{database, worldedit, Plot, PlotWorld};
 use crate::player::{Gamemode, PacketSender, PlayerPos};
 use crate::plot::data::sleep_time_for_tps;
@@ -5,8 +6,6 @@ use crate::profile::PlayerProfile;
 use crate::server::{get_version_string, Message};
 use mchprs_blocks::items::ItemStack;
 use mchprs_blocks::BlockPos;
-use mchprs_schematic::parse_block;
-use mchprs_world::World;
 use mchprs_network::packets::clientbound::{
     CCommands, CCommandsNode as Node, CDeclareCommandsNodeParser as Parser, ClientBoundPacket,
 };
@@ -14,7 +13,9 @@ use mchprs_network::packets::PacketEncoder;
 use mchprs_network::PlayerPacketSender;
 use mchprs_redpiler::CompilerOptions;
 use mchprs_save_data::plot_data::{Tps, WorldSendRate};
+use mchprs_schematic::parse_block;
 use mchprs_text::TextComponent;
+use mchprs_world::World;
 use std::ops::Add;
 use std::str::FromStr;
 use std::sync::LazyLock;
@@ -49,6 +50,7 @@ impl Plot {
             "teleport" | "tp" => "plots.visit",
             "lock" | "unlock" => "plots.lock",
             "sel" | "select" => "plots.select",
+            "clear" => "plots.clear",
             _ => {
                 self.players[player].send_error_message("Invalid argument for /plot");
                 return;
@@ -164,6 +166,24 @@ impl Plot {
                 } else {
                     self.players[player].send_system_message("You are not locked to this plot.");
                 }
+            }
+            "clear" => {
+                let is_owner = self.owner == Some(self.players[player].uuid);
+                if !is_owner && !self.players[player].has_permission("plots.worldedit.bypass") {
+                    self.players[player].send_error_message("You can only clear plots you own.");
+                    return;
+                }
+                if args.first() != Some(&"confirm") {
+                    self.players[player].send_system_message(&format!(
+                        "This will delete everything in plot ({}, {}) and cannot be undone. Run /p clear confirm to continue.",
+                        self.world.x, self.world.z
+                    ));
+                    return;
+                }
+                let start_time = Instant::now();
+                self.clear_plot();
+                self.players[player]
+                    .send_system_message(&format!("Plot cleared. ({:?})", start_time.elapsed()));
             }
             "select" | "sel" => {
                 let corners = self.world.get_corners();
@@ -389,6 +409,47 @@ impl Plot {
             "stop" => {
                 let _ = self.message_sender.send(Message::Shutdown);
             }
+            "watch" => {
+                let Some(file_name) = args.first() else {
+                    self.players[player]
+                        .send_error_message("Usage: /watch <filename> [-c [redpiler options]]");
+                    return false;
+                };
+                let compile_options = match args.get(1) {
+                    None => None,
+                    Some(&"-c") => Some(CompilerOptions::parse(&args[2..].join(" "))),
+                    Some(_) => {
+                        self.players[player]
+                            .send_error_message("Usage: /watch <filename> [-c [redpiler options]]");
+                        return false;
+                    }
+                };
+                let Some(path) = worldedit::schematic_path(self.players[player].uuid, file_name)
+                else {
+                    self.players[player].send_error_message("Filename is invalid");
+                    return false;
+                };
+                let exists = path.exists();
+                self.schematic_watch = Some(SchematicWatch::new(path, compile_options));
+                self.players[player].send_system_message(&format!(
+                    "Watching {}. It will be pasted in the center of this plot whenever it changes.",
+                    file_name
+                ));
+                if exists {
+                    self.reload_watched_schematic();
+                } else {
+                    self.players[player].send_system_message(
+                        "The file doesn't exist yet, it will be loaded once it is created.",
+                    );
+                }
+            }
+            "unwatch" => {
+                if self.schematic_watch.take().is_some() {
+                    self.players[player].send_system_message("Stopped watching schematic.");
+                } else {
+                    self.players[player].send_error_message("No schematic is being watched.");
+                }
+            }
             "plot" | "p" => {
                 if args.is_empty() {
                     self.players[player].send_error_message("Invalid number of arguments!");
@@ -528,8 +589,7 @@ impl Plot {
             }
             "setblock" => {
                 if args.len() < 4 {
-                    self.players[player]
-                        .send_error_message("Usage: /setblock <x> <y> <z> <block>");
+                    self.players[player].send_error_message("Usage: /setblock <x> <y> <z> <block>");
                     return false;
                 }
                 let player_pos = self.players[player].pos;
@@ -554,7 +614,11 @@ impl Plot {
                         return false;
                     }
                 };
-                let PlotWorld { x: plot_x, z: plot_z, .. } = self.world;
+                let PlotWorld {
+                    x: plot_x,
+                    z: plot_z,
+                    ..
+                } = self.world;
                 if !Plot::in_plot_bounds(plot_x, plot_z, x, z) {
                     self.players[player]
                         .send_error_message("Position is outside of the current plot!");
@@ -583,9 +647,11 @@ impl Plot {
                         match parse_relative_coord::<i32>($arg, $ref) {
                             Ok(v) => v,
                             Err(_) => {
-                                self.players[player].send_error_message(
-                                    concat!("Unable to parse ", $label, " coordinate!"),
-                                );
+                                self.players[player].send_error_message(concat!(
+                                    "Unable to parse ",
+                                    $label,
+                                    " coordinate!"
+                                ));
                                 return false;
                             }
                         }
@@ -597,7 +663,11 @@ impl Plot {
                 let x2 = parse_coord!(args[3], player_pos.x as i32, "x2");
                 let y2 = parse_coord!(args[4], player_pos.y as i32, "y2");
                 let z2 = parse_coord!(args[5], player_pos.z as i32, "z2");
-                let PlotWorld { x: plot_x, z: plot_z, .. } = self.world;
+                let PlotWorld {
+                    x: plot_x,
+                    z: plot_z,
+                    ..
+                } = self.world;
                 if !Plot::in_plot_bounds(plot_x, plot_z, x1, z1)
                     || !Plot::in_plot_bounds(plot_x, plot_z, x2, z2)
                 {
@@ -656,7 +726,8 @@ pub static DECLARE_COMMANDS: LazyLock<PacketEncoder> = LazyLock::new(|| {
             Node {
                 flags: CommandFlags::ROOT.bits() as i8,
                 children: vec![
-                    1, 4, 5, 6, 8, 10, 11, 13, 18, 30, 34, 41, 43, 44, 45, 49, 51, 52, 53, 56,
+                    1, 4, 5, 6, 8, 10, 11, 13, 18, 30, 34, 41, 43, 44, 45, 49, 51, 52, 53, 56, 60,
+                    63,
                 ],
                 redirect_node: None,
                 name: None,
@@ -774,7 +845,7 @@ pub static DECLARE_COMMANDS: LazyLock<PacketEncoder> = LazyLock::new(|| {
             // 13: /plot
             Node {
                 flags: (CommandFlags::LITERAL).bits() as i8,
-                children: vec![14, 15, 16, 17, 19, 20, 21, 22, 24, 25, 27, 28, 29],
+                children: vec![14, 15, 16, 17, 19, 20, 21, 22, 24, 25, 27, 28, 29, 64],
                 redirect_node: None,
                 name: Some("plot"),
                 parser: None,
@@ -1195,6 +1266,63 @@ pub static DECLARE_COMMANDS: LazyLock<PacketEncoder> = LazyLock::new(|| {
                 redirect_node: None,
                 name: Some("block"),
                 parser: Some(Parser::String(0)),
+                suggestions_type: None,
+            },
+            // 60: /watch
+            Node {
+                flags: CommandFlags::LITERAL.bits() as i8,
+                children: vec![61],
+                redirect_node: None,
+                name: Some("watch"),
+                parser: None,
+                suggestions_type: None,
+            },
+            // 61: /watch <filename>
+            Node {
+                flags: (CommandFlags::ARGUMENT
+                    | CommandFlags::EXECUTABLE
+                    | CommandFlags::HAS_SUGGESTIONS_TYPE)
+                    .bits() as i8,
+                children: vec![62],
+                redirect_node: None,
+                name: Some("filename"),
+                parser: Some(Parser::String(0)),
+                suggestions_type: Some("minecraft:ask_server"),
+            },
+            // 62: /watch <filename> [options]
+            Node {
+                flags: (CommandFlags::ARGUMENT | CommandFlags::EXECUTABLE).bits() as i8,
+                children: vec![],
+                redirect_node: None,
+                name: Some("options"),
+                parser: Some(Parser::String(2)),
+                suggestions_type: None,
+            },
+            // 63: /unwatch
+            Node {
+                flags: (CommandFlags::LITERAL | CommandFlags::EXECUTABLE).bits() as i8,
+                children: vec![],
+                redirect_node: None,
+                name: Some("unwatch"),
+                parser: None,
+                suggestions_type: None,
+            },
+            // 64: /plot clear
+            Node {
+                flags: (CommandFlags::LITERAL | CommandFlags::EXECUTABLE).bits() as i8,
+                children: vec![65],
+                redirect_node: None,
+                name: Some("clear"),
+                parser: None,
+                suggestions_type: None,
+            },
+            // 65: /plot clear confirm
+            Node {
+                flags: (CommandFlags::LITERAL | CommandFlags::EXECUTABLE).bits() as i8,
+                children: vec![],
+                redirect_node: None,
+                name: Some("confirm"),
+                parser: None,
                 suggestions_type: None,
             },
         ],

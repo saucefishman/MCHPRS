@@ -4,6 +4,7 @@ pub mod database;
 mod monitor;
 mod packet_handlers;
 mod scoreboard;
+mod watch;
 pub mod worldedit;
 
 use crate::config::CONFIG;
@@ -39,6 +40,7 @@ use tracing::{debug, error, warn};
 
 use self::data::sleep_time_for_tps;
 use self::scoreboard::Scoreboard;
+use self::watch::SchematicWatch;
 
 /// The width of a plot (2^n)
 pub const PLOT_SCALE: u32 = 5;
@@ -91,6 +93,7 @@ pub struct Plot {
     owner: Option<u128>,
     async_rt: Runtime,
     scoreboard: Scoreboard,
+    schematic_watch: Option<SchematicWatch>,
 }
 
 pub struct PlotWorld {
@@ -734,6 +737,34 @@ impl Plot {
         }
     }
 
+    /// Replaces every chunk in the plot with the empty plot template and resends the chunks to
+    /// players. This is much faster than setting every block to air.
+    fn clear_plot(&mut self) {
+        self.reset_redpiler();
+
+        let chunk_x_offset = self.world.x << PLOT_SCALE;
+        let chunk_z_offset = self.world.z << PLOT_SCALE;
+        self.world.chunks = data::empty_plot()
+            .chunk_data
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| {
+                c.load(
+                    chunk_x_offset + i as i32 / PLOT_WIDTH,
+                    chunk_z_offset + i as i32 % PLOT_WIDTH,
+                )
+            })
+            .collect();
+        self.world.to_be_ticked.clear();
+        if let Some(watch) = &mut self.schematic_watch {
+            watch.forget_last_bounds();
+        }
+
+        for player_idx in 0..self.players.len() {
+            self.update_view_pos_for_player(player_idx, true);
+        }
+    }
+
     fn destroy_entity(&mut self, entity_id: u32) {
         let destroy_entity = CRemoveEntities {
             entity_ids: vec![entity_id as i32],
@@ -979,6 +1010,7 @@ impl Plot {
 
     fn update(&mut self) {
         self.handle_messages();
+        self.update_schematic_watch();
 
         // Only tick if there are players in the plot
         if !self.players.is_empty() {
@@ -1151,6 +1183,7 @@ impl Plot {
             owner: database::get_plot_owner(x, z).map(|s| s.parse::<HyphenatedUUID>().unwrap().0),
             async_rt: Plot::create_async_rt(),
             scoreboard: Default::default(),
+            schematic_watch: None,
             world,
         }
     }

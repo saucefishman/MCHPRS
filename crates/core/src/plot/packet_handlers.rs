@@ -30,9 +30,13 @@ impl ServerBoundPacketHandler for Plot {
         packet: SCommandSuggestionsRequest,
         player_idx: usize,
     ) {
-        if !packet.text.starts_with("//load ") {
+        let Some(current) = ["//load ", "/watch "]
+            .iter()
+            .find_map(|prefix| packet.text.strip_prefix(prefix))
+        else {
             return;
-        }
+        };
+        let start = (packet.text.len() - current.len()) as i32;
 
         let mut path = PathBuf::from("./schems");
         if CONFIG.schemati {
@@ -40,10 +44,9 @@ impl ServerBoundPacketHandler for Plot {
             path.push(HyphenatedUUID(uuid).to_string());
         }
 
-        let current = &packet.text[7..];
         let mut res = CCommandSuggestionsResponse {
             id: packet.transaction_id,
-            start: 7,
+            start,
             length: current.len() as i32,
             matches: Vec::new(),
         };

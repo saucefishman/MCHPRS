@@ -6,6 +6,7 @@ use super::commands::CommandFlags;
 use super::{Plot, PlotWorld};
 use crate::player::{PacketSender, Player, PlayerPos};
 use execute::*;
+pub(super) use execute::schematic_path;
 use mchprs_blocks::block_entities::{BlockEntity, ContainerType};
 use mchprs_blocks::blocks::Block;
 use mchprs_blocks::{BlockFacing, BlockPos};
@@ -1058,8 +1059,15 @@ fn expand_selection(player: &mut Player, amount: BlockPos, contract: bool) {
     }
 }
 
-fn update(plot: &mut PlotWorld, first_pos: BlockPos, second_pos: BlockPos) {
-    for_each_block_mut_optimized(plot, first_pos, second_pos, |plot, pos| {
+pub(super) fn update(plot: &mut PlotWorld, first_pos: BlockPos, second_pos: BlockPos) {
+    // Clamp the region to the plot, chunks outside of it don't exist
+    let (plot_min, plot_max) = plot.get_corners();
+    let min = first_pos.min(second_pos).max(plot_min);
+    let max = first_pos.max(second_pos).min(plot_max);
+    if min.x > max.x || min.y > max.y || min.z > max.z {
+        return;
+    }
+    for_each_block_mut_optimized(plot, min, max, |plot, pos| {
         let block = plot.get_block(pos);
         mchprs_redstone::update(block, plot, pos);
     });

@@ -151,6 +151,10 @@ pub fn load_schematic(path: &Path) -> Result<WorldEditClipboard> {
     let mut file = File::open(path)?;
     let nbt = nbt::Blob::from_gzip_reader(&mut file)?;
 
+    if nbt.content.contains_key("Regions") {
+        return load_litematic(&nbt.content);
+    }
+
     let root = if nbt.content.contains_key("Schematic") {
         nbt_as!(&nbt["Schematic"], nbt::Value::Compound)
     } else {
@@ -295,6 +299,179 @@ fn load_schematic_sponge(
         offset_x,
         offset_y,
         offset_z,
+        data,
+        block_entities,
+    })
+}
+
+/// Reads an NBT integer value, accepting any integer width.
+fn nbt_int(value: &nbt::Value) -> Result<i32> {
+    use nbt::Value;
+    Ok(match value {
+        Value::Byte(v) => *v as i32,
+        Value::Short(v) => *v as i32,
+        Value::Int(v) => *v,
+        Value::Long(v) => *v as i32,
+        _ => bail!("Could not parse nbt value as integer"),
+    })
+}
+
+fn nbt_vec3(value: &nbt::Value) -> Result<(i32, i32, i32)> {
+    let map = nbt_as!(value, nbt::Value::Compound);
+    Ok((
+        nbt_int(&map["x"])?,
+        nbt_int(&map["y"])?,
+        nbt_int(&map["z"])?,
+    ))
+}
+
+/// Gets an entry from Litematica's tightly packed bit array, where entries may span across two
+/// longs.
+fn litematic_bit_array_get(longs: &[i64], bits: u32, index: usize) -> u32 {
+    let bits = bits as usize;
+    let mask = (1u64 << bits) - 1;
+    let start_offset = index * bits;
+    let start_idx = start_offset >> 6;
+    let end_idx = ((index + 1) * bits - 1) >> 6;
+    let start_bit = start_offset & 0x3F;
+    let start = longs[start_idx] as u64;
+    let val = if start_idx == end_idx {
+        start >> start_bit
+    } else {
+        let end = longs[end_idx] as u64;
+        (start >> start_bit) | (end << (64 - start_bit))
+    };
+    (val & mask) as u32
+}
+
+struct LitematicRegion<'a> {
+    nbt: &'a nbt::Map<String, nbt::Value>,
+    /// The minimum corner of the region, relative to the schematic origin
+    min: BlockPos,
+    size_x: u32,
+    size_y: u32,
+    size_z: u32,
+}
+
+/// Loads a Litematica schematic (`.litematic`). All regions are merged into a single clipboard
+/// with the schematic origin as the paste origin.
+/// https://github.com/maruohon/litematica/blob/pre-rewrite/fabric/1.20.x/src/main/java/fi/dy/masa/litematica/schematic/LitematicaSchematic.java
+fn load_litematic(nbt: &nbt::Map<String, nbt::Value>) -> Result<WorldEditClipboard> {
+    use nbt::Value;
+
+    let regions_nbt = nbt_as!(&nbt["Regions"], Value::Compound);
+    let mut regions = Vec::new();
+    for (name, region) in regions_nbt {
+        let region = nbt_as!(region, Value::Compound);
+        let (pos_x, pos_y, pos_z) = nbt_vec3(&region["Position"])
+            .with_context(|| format!("error reading position of region {}", name))?;
+        let (size_x, size_y, size_z) = nbt_vec3(&region["Size"])
+            .with_context(|| format!("error reading size of region {}", name))?;
+        // Sizes may be negative, in which case the region extends backwards from its position
+        let min_axis = |pos: i32, size: i32| if size < 0 { pos + size + 1 } else { pos };
+        regions.push(LitematicRegion {
+            nbt: region,
+            min: BlockPos::new(
+                min_axis(pos_x, size_x),
+                min_axis(pos_y, size_y),
+                min_axis(pos_z, size_z),
+            ),
+            size_x: size_x.unsigned_abs(),
+            size_y: size_y.unsigned_abs(),
+            size_z: size_z.unsigned_abs(),
+        });
+    }
+
+    let Some(first) = regions.first() else {
+        bail!("litematic has no regions");
+    };
+    let mut min = first.min;
+    let mut max = first.min;
+    for region in &regions {
+        let region_max = region.min
+            + BlockPos::new(
+                region.size_x as i32 - 1,
+                region.size_y as i32 - 1,
+                region.size_z as i32 - 1,
+            );
+        min = min.min(region.min);
+        max = max.max(region_max);
+    }
+    let size_x = (max.x - min.x) as u32 + 1;
+    let size_y = (max.y - min.y) as u32 + 1;
+    let size_z = (max.z - min.z) as u32 + 1;
+
+    let mut data = PalettedBitBuffer::new((size_x * size_y * size_z) as usize, 9);
+    let mut block_entities = FxHashMap::default();
+    for region in &regions {
+        let nbt_palette = nbt_as!(&region.nbt["BlockStatePalette"], Value::List);
+        let mut palette = Vec::with_capacity(nbt_palette.len());
+        for entry in nbt_palette {
+            let entry = nbt_as!(entry, Value::Compound);
+            let name = nbt_as!(&entry["Name"], Value::String);
+            let mut block = Block::from_name(name).unwrap_or(Block::Air);
+            if let Some(props) = entry.get("Properties") {
+                let props = nbt_as!(props, Value::Compound);
+                let mut properties = std::collections::HashMap::new();
+                for (k, v) in props {
+                    properties.insert(k.as_str(), nbt_as!(v, Value::String).as_str());
+                }
+                block.set_properties(properties);
+            }
+            palette.push(block.get_id());
+        }
+
+        let bits = (u32::BITS - (palette.len() as u32).saturating_sub(1).leading_zeros()).max(2);
+        let longs = nbt_as!(&region.nbt["BlockStates"], Value::LongArray);
+        let volume = (region.size_x * region.size_y * region.size_z) as usize;
+        if longs.len() * 64 < volume * bits as usize {
+            bail!("litematic block state array is too small");
+        }
+
+        let base = region.min - min;
+        let mut i = 0;
+        for y in 0..region.size_y {
+            for z in 0..region.size_z {
+                for x in 0..region.size_x {
+                    let palette_idx = litematic_bit_array_get(longs, bits, i) as usize;
+                    i += 1;
+                    let id = *palette
+                        .get(palette_idx)
+                        .context("litematic palette index out of bounds")?;
+                    let pos = base + BlockPos::new(x as i32, y as i32, z as i32);
+                    let idx =
+                        (pos.y as u32 * size_z * size_x) + (pos.z as u32 * size_x) + pos.x as u32;
+                    data.set_entry(idx as usize, id);
+                }
+            }
+        }
+
+        if let Some(tile_entities) = region.nbt.get("TileEntities") {
+            for tile_entity in nbt_as!(tile_entities, Value::List) {
+                let val = nbt_as!(tile_entity, Value::Compound);
+                let pos = base
+                    + BlockPos::new(
+                        nbt_int(&val["x"])?,
+                        nbt_int(&val["y"])?,
+                        nbt_int(&val["z"])?,
+                    );
+                let Some(Value::String(id)) = val.get("id") else {
+                    continue;
+                };
+                if let Some(parsed) = BlockEntity::from_nbt(id, val) {
+                    block_entities.insert(pos, parsed);
+                }
+            }
+        }
+    }
+
+    Ok(WorldEditClipboard {
+        offset_x: -min.x,
+        offset_y: -min.y,
+        offset_z: -min.z,
+        size_x,
+        size_y,
+        size_z,
         data,
         block_entities,
     })
