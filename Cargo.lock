@@ -1340,6 +1340,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mchprs_headless"
+version = "0.5.2-dev"
+dependencies = [
+ "anyhow",
+ "clap",
+ "mchprs_blocks",
+ "mchprs_redpiler",
+ "mchprs_redstone",
+ "mchprs_schematic",
+ "mchprs_world",
+]
+
+[[package]]
 name = "mchprs_network"
 version = "0.5.2-dev"
 dependencies = [
