@@ -360,8 +360,11 @@ fn load_litematic(nbt: &nbt::Map<String, nbt::Value>) -> Result<WorldEditClipboa
     use nbt::Value;
 
     let regions_nbt = nbt_as!(&nbt["Regions"], Value::Compound);
+    // NBT compounds iterate in random order, and the merge below must not depend on it
+    let mut regions_sorted: Vec<_> = regions_nbt.iter().collect();
+    regions_sorted.sort_by_key(|(name, _)| name.as_str());
     let mut regions = Vec::new();
-    for (name, region) in regions_nbt {
+    for (name, region) in regions_sorted {
         let region = nbt_as!(region, Value::Compound);
         let (pos_x, pos_y, pos_z) = nbt_vec3(&region["Position"])
             .with_context(|| format!("error reading position of region {}", name))?;
@@ -438,6 +441,10 @@ fn load_litematic(nbt: &nbt::Map<String, nbt::Value>) -> Result<WorldEditClipboa
                     let id = *palette
                         .get(palette_idx)
                         .context("litematic palette index out of bounds")?;
+                    // Bounding boxes of regions can overlap; empty cells must not erase blocks
+                    if id == 0 {
+                        continue;
+                    }
                     let pos = base + BlockPos::new(x as i32, y as i32, z as i32);
                     let idx =
                         (pos.y as u32 * size_z * size_x) + (pos.z as u32 * size_x) + pos.x as u32;
@@ -590,4 +597,69 @@ pub fn save_schematic(path: &Path, clipboard: &WorldEditClipboard) -> Result<()>
     nbt::to_gzip_writer(&mut file, &schematic, Some("Schematic"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nbt::Value;
+
+    fn compound(entries: Vec<(&str, Value)>) -> Value {
+        let mut map = nbt::Map::new();
+        for (key, value) in entries {
+            map.insert(key.to_string(), value);
+        }
+        Value::Compound(map)
+    }
+
+    fn vec3(x: i32, y: i32, z: i32) -> Value {
+        compound(vec![
+            ("x", Value::Int(x)),
+            ("y", Value::Int(y)),
+            ("z", Value::Int(z)),
+        ])
+    }
+
+    /// A 1x1x1 region at the origin holding `block`.
+    fn region(block: &str) -> Value {
+        let air = compound(vec![("Name", Value::String("minecraft:air".to_string()))]);
+        let solid = compound(vec![("Name", Value::String(block.to_string()))]);
+        compound(vec![
+            ("Position", vec3(0, 0, 0)),
+            ("Size", vec3(1, 1, 1)),
+            ("BlockStatePalette", Value::List(vec![air, solid])),
+            ("BlockStates", Value::LongArray(vec![1])),
+        ])
+    }
+
+    fn merged(regions: Vec<(&str, Value)>) -> u32 {
+        let mut root = nbt::Map::new();
+        root.insert("Regions".to_string(), compound(regions));
+        load_litematic(&root).unwrap().data.get_entry(0)
+    }
+
+    #[test]
+    fn litematic_air_does_not_erase_overlapping_regions() {
+        let stone = Block::Stone {}.get_id();
+        // Compounds iterate in random order, so try a few
+        for _ in 0..32 {
+            let regions = vec![
+                ("a", region("minecraft:stone")),
+                ("b", region("minecraft:air")),
+            ];
+            assert_eq!(merged(regions), stone);
+        }
+    }
+
+    #[test]
+    fn litematic_overlapping_regions_merge_in_name_order() {
+        let glass = Block::from_name("minecraft:glass").unwrap().get_id();
+        for _ in 0..32 {
+            let regions = vec![
+                ("a", region("minecraft:stone")),
+                ("b", region("minecraft:glass")),
+            ];
+            assert_eq!(merged(regions), glass);
+        }
+    }
 }
