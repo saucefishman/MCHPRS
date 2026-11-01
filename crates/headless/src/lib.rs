@@ -1,6 +1,10 @@
 //! Runs schematics on MCHPRS's redstone and redpiler code without a server. See the README for the
 //! file formats.
 
+mod probe;
+
+pub use probe::{parse_probes, ProbeFile};
+
 use anyhow::{bail, ensure, Context, Result};
 use mchprs_blocks::blocks::{Block, LeverFace};
 use mchprs_blocks::{BlockDirection, BlockPos};
@@ -8,6 +12,7 @@ use mchprs_redpiler::{BackendVariant, Compiler, CompilerOptions};
 use mchprs_schematic::{paste_clipboard, WorldEditClipboard};
 use mchprs_world::testing::TestWorld;
 use mchprs_world::World;
+use probe::Poller;
 use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::str::FromStr;
@@ -178,38 +183,50 @@ fn read_signal(block: Block) -> Option<bool> {
         Block::RedstoneTorch { lit }
         | Block::RedstoneWallTorch { lit, .. }
         | Block::RedstoneLamp { lit } => lit,
+        Block::Lever { powered, .. } => powered,
         _ => return None,
     })
 }
 
-struct Runner {
+struct Runner<'a> {
     world: TestWorld,
     compiler: Option<Compiler>,
+    poller: Option<Poller<'a>>,
 }
 
-impl Runner {
-    fn tick(&mut self) {
+impl Runner<'_> {
+    fn poll(&mut self) -> Result<()> {
+        match &mut self.poller {
+            Some(poller) => poller.poll(&self.world),
+            None => Ok(()),
+        }
+    }
+
+    fn tick(&mut self) -> Result<()> {
         if let Some(compiler) = &mut self.compiler {
             compiler.tick();
             compiler.flush(&mut self.world);
-            return;
+        } else {
+            tick_redstone(&mut self.world);
         }
-        tick_redstone(&mut self.world);
+        self.poll()
     }
 
-    fn toggle(&mut self, pos: BlockPos) {
+    fn toggle(&mut self, pos: BlockPos) -> Result<()> {
         if let Some(compiler) = &mut self.compiler {
             compiler.on_use_block(pos);
             compiler.flush(&mut self.world);
-            return;
+        } else {
+            mchprs_redstone::on_use(self.world.get_block(pos), &mut self.world, pos);
         }
-        mchprs_redstone::on_use(self.world.get_block(pos), &mut self.world, pos);
+        self.poll()
     }
 
-    fn run_ticks(&mut self, ticks: u32) {
+    fn run_ticks(&mut self, ticks: u32) -> Result<()> {
         for _ in 0..ticks {
-            self.tick();
+            self.tick()?;
         }
+        Ok(())
     }
 
     fn read(&self, name: &str, pos: BlockPos) -> Result<bool> {
@@ -225,6 +242,27 @@ pub fn run_test(
     script: &[ScriptCommand],
     mode: Mode,
     add_levers: &[String],
+) -> Result<usize> {
+    run_test_with_probes(
+        cb,
+        pins,
+        script,
+        mode,
+        add_levers,
+        None,
+        &mut std::io::stdout(),
+    )
+}
+
+/// Like [`run_test`], writing the output of `probes` to `probe_out`.
+pub fn run_test_with_probes(
+    cb: &WorldEditClipboard,
+    pins: &[Pin],
+    script: &[ScriptCommand],
+    mode: Mode,
+    add_levers: &[String],
+    probes: Option<&ProbeFile>,
+    probe_out: &mut dyn std::io::Write,
 ) -> Result<usize> {
     for name in add_levers {
         ensure!(
@@ -274,6 +312,9 @@ pub fn run_test(
             _ => {}
         }
     }
+    if let Some(probes) = probes {
+        probes.check(cb, &world)?;
+    }
 
     if mode != Mode::NoUpdate {
         update_all(&mut world, cb);
@@ -295,12 +336,20 @@ pub fn run_test(
         compiler
     });
 
-    let mut runner = Runner { world, compiler };
+    let poller = match probes {
+        Some(probes) if !probes.is_empty() => Some(Poller::new(probes, &world, probe_out)?),
+        _ => None,
+    };
+    let mut runner = Runner {
+        world,
+        compiler,
+        poller,
+    };
     let label = mode.name();
     let mut fails = 0;
     for command in script {
         match command {
-            ScriptCommand::Settle(ticks) => runner.run_ticks(*ticks),
+            ScriptCommand::Settle(ticks) => runner.run_ticks(*ticks)?,
             ScriptCommand::Set(name, value) => {
                 let lever = inputs[name.as_str()];
                 let on = matches!(
@@ -308,14 +357,14 @@ pub fn run_test(
                     Block::Lever { powered: true, .. }
                 );
                 if on != *value {
-                    runner.toggle(lever);
+                    runner.toggle(lever)?;
                 }
             }
             ScriptCommand::Pulse(name, ticks) => {
                 let lever = inputs[name.as_str()];
-                runner.toggle(lever);
-                runner.run_ticks(*ticks);
-                runner.toggle(lever);
+                runner.toggle(lever)?;
+                runner.run_ticks(*ticks)?;
+                runner.toggle(lever)?;
             }
             ScriptCommand::Expect(name, want) => {
                 let got = runner.read(name, outputs[name.as_str()])?;
@@ -476,6 +525,125 @@ mod tests {
         assert!(parse_script("frobnicate\n").is_err());
         assert!(parse_script("expect a 2\n").is_err());
         assert!("fast".parse::<Mode>().is_err());
+    }
+
+    /// The lever's position and the repeater's output in `circuit`, printed on the lever's edge
+    fn repeater_probe(edge: &str, enable: &str) -> ProbeFile {
+        parse_probes(&format!(
+            r#"{{"version":1,"schematic_size":[6,4,3],"probes":[{{
+                "name":"t",
+                "format":[{{"text":"r="}},{{"bits":[0],"radix":"d"}},{{"text":"\n"}}],
+                "trigger":{{"pos":[1,2,1],"edge":"{edge}"}},
+                "enable":{enable},
+                "data":[{{"pos":[2,1,1]}}]
+            }}]}}"#
+        ))
+        .unwrap()
+    }
+
+    fn probe_output(delay: u8, script: &str, probes: &ProbeFile, mode: Mode) -> Result<String> {
+        let pins = parse_pins(PINS)?;
+        let mut out = Vec::new();
+        run_test_with_probes(
+            &circuit(delay),
+            &pins,
+            &parse_script(script)?,
+            mode,
+            &[],
+            Some(probes),
+            &mut out,
+        )?;
+        Ok(String::from_utf8(out)?)
+    }
+
+    const CONST_ON: &str = r#"{"const":1}"#;
+
+    #[test]
+    fn probe_samples_before_the_edge_reaches_a_one_tick_repeater() {
+        let probes = repeater_probe("rising", CONST_ON);
+        for mode in [Mode::Redstone, Mode::Redpiler] {
+            let output = probe_output(1, "settle 2\nset a 1\nsettle 4\n", &probes, mode).unwrap();
+            assert_eq!(output, "r=0\n", "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn probe_reads_state_left_by_the_previous_edge() {
+        let probes = repeater_probe("rising", CONST_ON);
+        let script = "settle 2\nset a 1\nsettle 8\nset a 0\nsettle 1\nset a 1\nsettle 8\n";
+        for mode in [Mode::Redstone, Mode::Redpiler] {
+            let output = probe_output(4, script, &probes, mode).unwrap();
+            assert_eq!(output, "r=0\nr=1\n", "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn probe_falling_edge_fires() {
+        let probes = repeater_probe("falling", CONST_ON);
+        for mode in [Mode::Redstone, Mode::Redpiler] {
+            let output =
+                probe_output(1, "settle 2\nset a 1\nsettle 4\nset a 0\n", &probes, mode).unwrap();
+            assert_eq!(output, "r=1\n", "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn probe_enable_gates_output() {
+        let script = "set a 1\nsettle 4\nset a 0\nsettle 4\nset a 1\nsettle 4\n";
+        let never = repeater_probe("rising", r#"{"const":0}"#);
+        assert_eq!(probe_output(1, script, &never, Mode::Redstone).unwrap(), "");
+        // The repeater is low at both rising edges
+        let low = repeater_probe("rising", r#"{"pos":[2,1,1]}"#);
+        assert_eq!(probe_output(1, script, &low, Mode::Redpiler).unwrap(), "");
+        // The lever has just gone high, so it enables its own edge
+        let high = repeater_probe("rising", r#"{"pos":[1,2,1]}"#);
+        assert_eq!(
+            probe_output(1, script, &high, Mode::Redpiler).unwrap(),
+            "r=0\nr=0\n"
+        );
+    }
+
+    #[test]
+    fn probes_are_checked_against_the_schematic() {
+        let wrong_size =
+            parse_probes(r#"{"version":1,"schematic_size":[1,1,1],"probes":[]}"#).unwrap();
+        assert!(probe_output(1, "settle 1\n", &wrong_size, Mode::Redstone).is_err());
+        // Stone floor has no signal
+        let stone = repeater_probe("rising", r#"{"pos":[0,0,1]}"#);
+        assert!(probe_output(1, "settle 1\n", &stone, Mode::Redpiler).is_err());
+    }
+
+    #[test]
+    fn marker_blocks_conduct_like_stone() {
+        // Lever on the marker block, with a wall torch on the marker block's side
+        for marker in [Block::Stone {}, Block::EmeraldBlock {}, Block::GoldBlock {}] {
+            let mut world = TestWorld::new(1, 1, 1);
+            world.set_block(BlockPos::new(1, 1, 1), marker);
+            world.set_block(
+                BlockPos::new(1, 2, 1),
+                Block::Lever {
+                    face: LeverFace::Floor,
+                    facing: BlockDirection::North,
+                    powered: false,
+                },
+            );
+            world.set_block(
+                BlockPos::new(2, 1, 1),
+                Block::RedstoneWallTorch {
+                    lit: true,
+                    facing: BlockDirection::East,
+                },
+            );
+            let origin = BlockPos::new(0, 0, 0);
+            let cb = create_clipboard(&mut world, origin, origin, BlockPos::new(3, 3, 2));
+            let pins = parse_pins("a 0 1 1 1 0\ny 2 1 1 1 0\n").unwrap();
+            let script =
+                parse_script("settle 4\nexpect y 1\nset a 1\nsettle 4\nexpect y 0\n").unwrap();
+            for mode in [Mode::Redstone, Mode::Redpiler] {
+                let fails = run_test(&cb, &pins, &script, mode, &[]).unwrap();
+                assert_eq!(fails, 0, "{marker:?} {mode:?}");
+            }
+        }
     }
 
     #[test]

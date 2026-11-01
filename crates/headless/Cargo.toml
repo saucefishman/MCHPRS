@@ -19,3 +19,5 @@ mchprs_redstone = { path = "../redstone" }
 mchprs_schematic = { path = "../schematic" }
 anyhow = { workspace = true }
 clap = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }

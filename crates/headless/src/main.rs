@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use mchprs_headless::{parse_cuts, parse_pins, parse_script, run_test, settle, Mode};
+use mchprs_headless::{
+    parse_cuts, parse_pins, parse_probes, parse_script, run_test_with_probes, settle, Mode,
+};
 use mchprs_schematic::load_schematic;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -25,6 +27,9 @@ enum Command {
         /// Place a stone and lever at this pin before running
         #[arg(long = "add-lever", value_name = "NAME")]
         add_levers: Vec<String>,
+        /// JSON file of signals to print when their triggers change
+        #[arg(long)]
+        probes: Option<PathBuf>,
     },
     /// Run a schematic until nothing is pending and write its signal block states
     Settle {
@@ -51,14 +56,26 @@ fn run(args: Args) -> Result<ExitCode> {
             script,
             modes,
             add_levers,
+            probes,
         } => {
             let cb =
                 load_schematic(&schem).with_context(|| format!("loading {}", schem.display()))?;
             let pins = parse_pins(&read(&pins)?)?;
             let script = parse_script(&read(&script)?)?;
+            let probes = probes
+                .map(|path| parse_probes(&read(&path)?).with_context(|| path.display().to_string()))
+                .transpose()?;
             let mut fails = 0;
             for mode in modes {
-                fails += run_test(&cb, &pins, &script, mode, &add_levers)?;
+                fails += run_test_with_probes(
+                    &cb,
+                    &pins,
+                    &script,
+                    mode,
+                    &add_levers,
+                    probes.as_ref(),
+                    &mut std::io::stdout(),
+                )?;
             }
             Ok(ExitCode::from((fails > 0) as u8))
         }

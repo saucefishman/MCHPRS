@@ -1350,6 +1350,8 @@ dependencies = [
  "mchprs_redstone",
  "mchprs_schematic",
  "mchprs_world",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
