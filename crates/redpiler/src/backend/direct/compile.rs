@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tracing::trace;
 
 use super::node::{ForwardLink, Node, NodeId, NodeInput, NodeType, Nodes, NonMaxU8};
+use super::probe::Probes;
 use super::DirectBackend;
 
 #[derive(Debug, Default)]
@@ -197,6 +198,8 @@ pub fn compile(
             backend.pos_map.insert(pos, backend.nodes.get(i));
         }
     }
+
+    backend.probes = Probes::new(&options.probes, &backend.pos_map, &backend.nodes);
 
     // Schedule backend ticks
     for entry in ticks {

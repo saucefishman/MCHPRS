@@ -2,6 +2,7 @@
 
 mod compile;
 mod node;
+mod probe;
 mod tick;
 mod update;
 
@@ -13,9 +14,11 @@ use crate::{block_powered_mut, CompilerOptions};
 use mchprs_blocks::block_entities::BlockEntity;
 use mchprs_blocks::blocks::{Block, ComparatorMode, Instrument};
 use mchprs_blocks::BlockPos;
+use mchprs_probes::ProbeHit;
 use mchprs_redstone::{bool_to_ss, noteblock};
 use mchprs_world::{TickEntry, TickPriority, World};
 use node::{Node, NodeId, NodeType, Nodes};
+use probe::Probes;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::fmt::Write;
@@ -122,6 +125,7 @@ pub struct DirectBackend {
     scheduler: TickScheduler,
     events: Vec<Event>,
     noteblock_info: Vec<(SmallVec<[BlockPos; 1]>, Instrument, u8)>,
+    probes: Probes,
 }
 
 impl DirectBackend {
@@ -206,10 +210,15 @@ impl JITBackend for DirectBackend {
         self.pos_map.clear();
         self.noteblock_info.clear();
         self.events.clear();
+        self.probes = Default::default();
     }
 
     fn on_use_block(&mut self, pos: BlockPos) {
-        let node_id = self.pos_map[&pos];
+        // Optimization removes levers that reach no output
+        let Some(&node_id) = self.pos_map.get(&pos) else {
+            warn!("Tried to use {:?}, which has no redpiler node", pos);
+            return;
+        };
         let node = &self.nodes[node_id];
         match node.ty {
             NodeType::Button => {
@@ -224,6 +233,7 @@ impl JITBackend for DirectBackend {
             }
             _ => warn!("Tried to use a {:?} redpiler node", node.ty),
         }
+        self.probes.poll(&self.nodes);
     }
 
     fn set_pressure_plate(&mut self, pos: BlockPos, powered: bool) {
@@ -235,6 +245,7 @@ impl JITBackend for DirectBackend {
             }
             _ => warn!("Tried to set pressure plate state for a {:?}", node.ty),
         }
+        self.probes.poll(&self.nodes);
     }
 
     fn tick(&mut self) {
@@ -245,6 +256,7 @@ impl JITBackend for DirectBackend {
         });
 
         self.scheduler.end_tick(queues);
+        self.probes.poll(&self.nodes);
     }
 
     fn flush<W: World>(&mut self, world: &mut W, io_only: bool) {
@@ -290,6 +302,10 @@ impl JITBackend for DirectBackend {
 
     fn has_pending_ticks(&self) -> bool {
         self.scheduler.has_pending_ticks()
+    }
+
+    fn drain_probe_hits(&mut self, hits: &mut Vec<ProbeHit>) {
+        hits.append(&mut self.probes.hits);
     }
 }
 

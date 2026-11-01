@@ -7,6 +7,7 @@ use super::task_monitor::TaskMonitor;
 use super::CompilerOptions;
 use enum_dispatch::enum_dispatch;
 use mchprs_blocks::BlockPos;
+use mchprs_probes::ProbeHit;
 use mchprs_world::{TickEntry, World};
 
 #[enum_dispatch]
@@ -31,6 +32,8 @@ pub trait JITBackend {
     fn flush<W: World>(&mut self, world: &mut W, io_only: bool);
     fn reset<W: World>(&mut self, world: &mut W, io_only: bool);
     fn has_pending_ticks(&self) -> bool;
+    /// Moves the probes that have fired since the last call into `hits`
+    fn drain_probe_hits(&mut self, hits: &mut Vec<ProbeHit>);
     /// Inspect block for debugging
     fn inspect(&mut self, pos: BlockPos);
 }

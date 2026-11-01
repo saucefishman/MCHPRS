@@ -8,6 +8,7 @@ pub mod task_monitor;
 use backend::{BackendDispatcher, JITBackend};
 use mchprs_blocks::blocks::Block;
 use mchprs_blocks::BlockPos;
+use mchprs_probes::{ProbeHit, ProbeSource, ProbeSpec};
 use mchprs_world::{for_each_block_mut_optimized, TickEntry, World};
 use std::sync::Arc;
 use std::time::Instant;
@@ -54,6 +55,11 @@ pub struct CompilerOptions {
     pub backend_variant: BackendVariant,
     /// A comma seperated list of passes to run. This can only be used by the rilc driver.
     pub passes: Option<String>,
+    /// Signals to sample. The blocks they read are kept as outputs, so optimization can't remove
+    /// them.
+    pub probes: Vec<ProbeSpec>,
+    /// Blocks kept as outputs even if nothing reads them, such as a lever the server will use
+    pub keep: Vec<BlockPos>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
@@ -109,6 +115,19 @@ impl CompilerOptions {
         }
         co
     }
+}
+
+/// Every position the probes in `options` read
+pub(crate) fn probe_positions(options: &CompilerOptions) -> impl Iterator<Item = BlockPos> + '_ {
+    options.probes.iter().flat_map(|spec| {
+        let sources = std::iter::once(&spec.enable)
+            .chain(&spec.data)
+            .filter_map(|source| match source {
+                ProbeSource::Pos(pos) => Some(*pos),
+                ProbeSource::Const(_) => None,
+            });
+        std::iter::once(spec.trigger).chain(sources)
+    })
 }
 
 #[derive(Default)]
@@ -240,6 +259,11 @@ impl Compiler {
         self.backend().flush(world, io_only);
     }
 
+    /// Moves the probes that have fired since the last call into `hits`
+    pub fn drain_probe_hits(&mut self, hits: &mut Vec<ProbeHit>) {
+        self.backend().drain_probe_hits(hits);
+    }
+
     pub fn inspect(&mut self, pos: BlockPos) {
         if let Some(backend) = &mut self.backend {
             backend.inspect(pos);
@@ -276,6 +300,8 @@ mod tests {
             print_before_backend: false,
             backend_variant: BackendVariant::default(),
             passes: None,
+            probes: Vec::new(),
+            keep: Vec::new(),
         };
         let options = CompilerOptions::parse(input);
 

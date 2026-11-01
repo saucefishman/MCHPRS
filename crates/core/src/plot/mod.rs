@@ -3,6 +3,7 @@ mod data;
 pub mod database;
 mod monitor;
 mod packet_handlers;
+mod probes;
 mod scoreboard;
 mod watch;
 pub mod worldedit;
@@ -39,6 +40,7 @@ use tokio::runtime::Runtime;
 use tracing::{debug, error, warn};
 
 use self::data::sleep_time_for_tps;
+use self::probes::PlotProbes;
 use self::scoreboard::Scoreboard;
 use self::watch::SchematicWatch;
 
@@ -94,6 +96,7 @@ pub struct Plot {
     async_rt: Runtime,
     scoreboard: Scoreboard,
     schematic_watch: Option<SchematicWatch>,
+    probes: Option<PlotProbes>,
 }
 
 pub struct PlotWorld {
@@ -272,7 +275,16 @@ impl Plot {
     fn tickn(&mut self, ticks: u64) {
         if self.redpiler.is_active() {
             self.timings.tickn(ticks);
-            self.redpiler.tickn(ticks);
+            // The clock's lever has to toggle between ticks, so batches stop at each toggle
+            let mut left = ticks;
+            while left > 0 {
+                let run = self
+                    .clock_ticks_until_toggle()
+                    .map_or(left, |until| left.min(until as u64));
+                self.redpiler.tickn(run);
+                self.advance_clock(run as u32);
+                left -= run;
+            }
             return;
         }
 
@@ -285,6 +297,7 @@ impl Plot {
         self.timings.tick();
         if self.redpiler.is_active() {
             self.redpiler.tick();
+            self.advance_clock(1);
             return;
         }
 
@@ -298,6 +311,8 @@ impl Plot {
             let entry = self.world.to_be_ticked.remove(0);
             mchprs_redstone::tick(self.world.get_block(entry.pos), &mut self.world, entry.pos);
         }
+        self.poll_world_probes();
+        self.advance_clock(1);
     }
 
     /// Send a block change to all connected players
@@ -677,8 +692,12 @@ impl Plot {
         self.timings.reset_timings();
     }
 
-    fn start_redpiler(&mut self, options: CompilerOptions) {
+    fn start_redpiler(&mut self, mut options: CompilerOptions) {
         debug!("Starting redpiler");
+        self.update_probes();
+        self.forget_probe_poller();
+        options.probes = self.probe_specs();
+        options.keep.extend(self.clock_lever());
         self.scoreboard
             .set_redpiler_state(&self.players, RedpilerState::Compiling);
         self.scoreboard
@@ -725,12 +744,15 @@ impl Plot {
     fn reset_redpiler(&mut self) {
         if self.redpiler.is_active() {
             debug!("Discarding redpiler");
+            self.update_probes();
             let bounds = self.world.get_corners();
             self.redpiler.reset(&mut self.world, bounds);
             self.scoreboard
                 .set_redpiler_state(&self.players, RedpilerState::Stopped);
             self.scoreboard
                 .set_redpiler_options(&self.players, &Default::default());
+
+            self.forget_probe_poller();
 
             // reseting redpiler could cause a large amount of block updates
             self.reset_timings();
@@ -740,6 +762,7 @@ impl Plot {
     /// Replaces every chunk in the plot with the empty plot template and resends the chunks to
     /// players. This is much faster than setting every block to air.
     fn clear_plot(&mut self) {
+        self.clear_probes();
         self.reset_redpiler();
 
         let chunk_x_offset = self.world.x << PLOT_SCALE;
@@ -1092,6 +1115,8 @@ impl Plot {
         // Handle commands before removing players just in case they ran a command before leaving
         self.handle_commands();
 
+        self.update_probes();
+
         self.remove_dc_players();
         self.remove_oob_players();
     }
@@ -1184,6 +1209,7 @@ impl Plot {
             async_rt: Plot::create_async_rt(),
             scoreboard: Default::default(),
             schematic_watch: None,
+            probes: None,
             world,
         }
     }

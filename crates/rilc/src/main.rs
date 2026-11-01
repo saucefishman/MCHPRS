@@ -166,6 +166,8 @@ fn main() {
                 print_before_backend: false,
                 backend_variant: Default::default(),
                 passes,
+                probes: Vec::new(),
+                keep: Vec::new(),
             };
             compile::compile(&input_path, &output_path, &options);
         }

@@ -14,10 +14,9 @@ include.workspace = true
 [dependencies]
 mchprs_world = { path = "../world", features = ["testing"] }
 mchprs_blocks = { path = "../blocks" }
+mchprs_probes = { path = "../probes" }
 mchprs_redpiler = { path = "../redpiler" }
 mchprs_redstone = { path = "../redstone" }
 mchprs_schematic = { path = "../schematic" }
 anyhow = { workspace = true }
 clap = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }

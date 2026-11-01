@@ -1,21 +1,19 @@
 //! Runs schematics on MCHPRS's redstone and redpiler code without a server. See the README for the
 //! file formats.
 
-mod probe;
-
-pub use probe::{parse_probes, ProbeFile};
-
 use anyhow::{bail, ensure, Context, Result};
 use mchprs_blocks::blocks::{Block, LeverFace};
 use mchprs_blocks::{BlockDirection, BlockPos};
+use mchprs_probes::{read_signal, ProbeHit, ServerClock, WorldPoller};
 use mchprs_redpiler::{BackendVariant, Compiler, CompilerOptions};
 use mchprs_schematic::{paste_clipboard, WorldEditClipboard};
 use mchprs_world::testing::TestWorld;
 use mchprs_world::World;
-use probe::Poller;
 use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::str::FromStr;
+
+pub use mchprs_probes::{parse_server_file, ServerFile};
 
 /// Where schematic coordinate (0, 0, 0) lands in the world.
 const BASE: BlockPos = BlockPos::new(8, 8, 8);
@@ -175,31 +173,36 @@ fn tick_redstone(world: &mut TestWorld) {
     }
 }
 
-fn read_signal(block: Block) -> Option<bool> {
-    Some(match block {
-        Block::Repeater(repeater) => repeater.powered,
-        Block::Comparator(comparator) => comparator.powered,
-        Block::RedstoneWire(wire) => wire.power > 0,
-        Block::RedstoneTorch { lit }
-        | Block::RedstoneWallTorch { lit, .. }
-        | Block::RedstoneLamp { lit } => lit,
-        Block::Lever { powered, .. } => powered,
-        _ => return None,
-    })
+struct ProbeOutput<'a> {
+    file: &'a ServerFile,
+    /// Only used when redpiler isn't compiled
+    poller: Option<WorldPoller>,
+    hits: Vec<ProbeHit>,
+    out: &'a mut dyn std::io::Write,
 }
 
 struct Runner<'a> {
     world: TestWorld,
     compiler: Option<Compiler>,
-    poller: Option<Poller<'a>>,
+    probes: Option<ProbeOutput<'a>>,
+    clock: Option<ServerClock>,
 }
 
 impl Runner<'_> {
     fn poll(&mut self) -> Result<()> {
-        match &mut self.poller {
-            Some(poller) => poller.poll(&self.world),
-            None => Ok(()),
+        let Some(probes) = &mut self.probes else {
+            return Ok(());
+        };
+        if let Some(compiler) = &mut self.compiler {
+            compiler.drain_probe_hits(&mut probes.hits);
+        } else if let Some(poller) = &mut probes.poller {
+            poller.poll(&self.world, &mut probes.hits);
         }
+        for hit in probes.hits.drain(..) {
+            probes.out.write_all(&probes.file.render(&hit))?;
+            probes.out.flush()?;
+        }
+        Ok(())
     }
 
     fn tick(&mut self) -> Result<()> {
@@ -209,7 +212,14 @@ impl Runner<'_> {
         } else {
             tick_redstone(&mut self.world);
         }
-        self.poll()
+        self.poll()?;
+        if let Some(clock) = &mut self.clock
+            && clock.advance(1)
+        {
+            let lever = clock.pos();
+            self.toggle(lever)?;
+        }
+        Ok(())
     }
 
     fn toggle(&mut self, pos: BlockPos) -> Result<()> {
@@ -249,19 +259,25 @@ pub fn run_test(
         script,
         mode,
         add_levers,
+        Default::default(),
         None,
+        false,
         &mut std::io::stdout(),
     )
 }
 
-/// Like [`run_test`], writing the output of `probes` to `probe_out`.
+/// Like [`run_test`], compiling redpiler with `options` and writing the output of `probes` to
+/// `probe_out`. `run_clock` toggles the lever of the clock in `probes` as the script ticks.
+#[allow(clippy::too_many_arguments)]
 pub fn run_test_with_probes(
     cb: &WorldEditClipboard,
     pins: &[Pin],
     script: &[ScriptCommand],
     mode: Mode,
     add_levers: &[String],
-    probes: Option<&ProbeFile>,
+    mut options: CompilerOptions,
+    probes: Option<&ServerFile>,
+    run_clock: bool,
     probe_out: &mut dyn std::io::Write,
 ) -> Result<usize> {
     for name in add_levers {
@@ -270,6 +286,13 @@ pub fn run_test_with_probes(
             "--add-lever {name}: no such pin"
         );
     }
+
+    let clock = probes.and_then(|file| file.clock(BASE));
+    ensure!(
+        !run_clock || clock.is_some(),
+        "--run-clock: the file has no clock"
+    );
+    let clock = clock.filter(|_| run_clock);
 
     let mut world = paste(cb);
     let mut inputs = BTreeMap::new();
@@ -313,7 +336,7 @@ pub fn run_test_with_probes(
         }
     }
     if let Some(probes) = probes {
-        probes.check(cb, &world)?;
+        probes.check([cb.size_x, cb.size_y, cb.size_z], &world, BASE)?;
     }
 
     if mode != Mode::NoUpdate {
@@ -321,10 +344,11 @@ pub fn run_test_with_probes(
     }
     let compiler = (mode == Mode::Redpiler).then(|| {
         let mut compiler = Compiler::default();
-        let options = CompilerOptions {
-            backend_variant: BackendVariant::Direct,
-            ..Default::default()
-        };
+        options.backend_variant = BackendVariant::Direct;
+        if let Some(probes) = probes {
+            options.probes = probes.specs(BASE);
+        }
+        options.keep.extend(clock.as_ref().map(ServerClock::pos));
         let max = BlockPos::new(
             world.x_size * 16 - 1,
             world.y_size * 16 - 1,
@@ -336,14 +360,21 @@ pub fn run_test_with_probes(
         compiler
     });
 
-    let poller = match probes {
-        Some(probes) if !probes.is_empty() => Some(Poller::new(probes, &world, probe_out)?),
-        _ => None,
-    };
+    let probes = probes
+        .filter(|file| !file.is_empty())
+        .map(|file| ProbeOutput {
+            file,
+            poller: compiler
+                .is_none()
+                .then(|| WorldPoller::new(file.specs(BASE), &world)),
+            hits: Vec::new(),
+            out: probe_out,
+        });
     let mut runner = Runner {
         world,
         compiler,
-        poller,
+        probes,
+        clock,
     };
     let label = mode.name();
     let mut fails = 0;
@@ -528,9 +559,9 @@ mod tests {
     }
 
     /// The lever's position and the repeater's output in `circuit`, printed on the lever's edge
-    fn repeater_probe(edge: &str, enable: &str) -> ProbeFile {
-        parse_probes(&format!(
-            r#"{{"version":1,"schematic_size":[6,4,3],"probes":[{{
+    fn repeater_probe(edge: &str, enable: &str) -> ServerFile {
+        parse_server_file(&format!(
+            r#"{{"version":2,"schematic_size":[6,4,3],"probes":[{{
                 "name":"t",
                 "format":[{{"text":"r="}},{{"bits":[0],"radix":"d"}},{{"text":"\n"}}],
                 "trigger":{{"pos":[1,2,1],"edge":"{edge}"}},
@@ -541,7 +572,17 @@ mod tests {
         .unwrap()
     }
 
-    fn probe_output(delay: u8, script: &str, probes: &ProbeFile, mode: Mode) -> Result<String> {
+    fn probe_output(delay: u8, script: &str, probes: &ServerFile, mode: Mode) -> Result<String> {
+        probe_output_with(delay, script, probes, mode, Default::default())
+    }
+
+    fn probe_output_with(
+        delay: u8,
+        script: &str,
+        probes: &ServerFile,
+        mode: Mode,
+        options: CompilerOptions,
+    ) -> Result<String> {
         let pins = parse_pins(PINS)?;
         let mut out = Vec::new();
         run_test_with_probes(
@@ -550,7 +591,9 @@ mod tests {
             &parse_script(script)?,
             mode,
             &[],
+            options,
             Some(probes),
+            false,
             &mut out,
         )?;
         Ok(String::from_utf8(out)?)
@@ -606,11 +649,369 @@ mod tests {
     #[test]
     fn probes_are_checked_against_the_schematic() {
         let wrong_size =
-            parse_probes(r#"{"version":1,"schematic_size":[1,1,1],"probes":[]}"#).unwrap();
+            parse_server_file(r#"{"version":2,"schematic_size":[1,1,1],"probes":[]}"#).unwrap();
         assert!(probe_output(1, "settle 1\n", &wrong_size, Mode::Redstone).is_err());
         // Stone floor has no signal
         let stone = repeater_probe("rising", r#"{"pos":[0,0,1]}"#);
         assert!(probe_output(1, "settle 1\n", &stone, Mode::Redpiler).is_err());
+    }
+
+    const FLAGS: [&str; 4] = ["", "-o", "-i", "-oi"];
+
+    /// `circuit`'s lever as a clock, with a probe of the repeater on its rising edge
+    fn clocked_file() -> ServerFile {
+        parse_server_file(
+            r#"{"version":2,"schematic_size":[6,4,3],"probes":[{
+                "name":"t",
+                "format":[{"bits":[0],"radix":"d"},{"text":"\n"}],
+                "trigger":{"pos":[1,2,1],"edge":"rising"},
+                "enable":{"const":1},
+                "data":[{"pos":[2,1,1]}]
+            }],"clock":{"pin":"clk","pos":[1,2,1],"half_period_ticks":3}}"#,
+        )
+        .unwrap()
+    }
+
+    fn clocked_run(
+        cb: &WorldEditClipboard,
+        pins: &str,
+        script: &str,
+        file: &ServerFile,
+        mode: Mode,
+        options: CompilerOptions,
+        run_clock: bool,
+    ) -> Result<(usize, String)> {
+        let mut out = Vec::new();
+        let fails = run_test_with_probes(
+            cb,
+            &parse_pins(pins)?,
+            &parse_script(script)?,
+            mode,
+            &[],
+            options,
+            Some(file),
+            run_clock,
+            &mut out,
+        )?;
+        Ok((fails, String::from_utf8(out)?))
+    }
+
+    #[test]
+    fn clock_toggles_the_lever_every_half_period() {
+        // The lever toggles after ticks 3, 6 and 9, and the repeater follows one tick later
+        let script = "settle 3\nexpect y 0\nsettle 1\nexpect y 1\nsettle 2\nexpect y 1\nsettle 1\nexpect y 0\nsettle 3\nexpect y 1\n";
+        let file = clocked_file();
+        for mode in [Mode::Redstone, Mode::Redpiler] {
+            let (fails, output) = clocked_run(
+                &circuit(1),
+                PINS,
+                script,
+                &file,
+                mode,
+                Default::default(),
+                true,
+            )
+            .unwrap();
+            assert_eq!((fails, output.as_str()), (0, "0\n0\n"), "{mode:?}");
+        }
+        // Optimizing drops the dust that `expect` reads, so only the probe can be checked
+        for flags in FLAGS {
+            let (_, output) = clocked_run(
+                &circuit(1),
+                PINS,
+                script,
+                &file,
+                Mode::Redpiler,
+                CompilerOptions::parse(flags),
+                true,
+            )
+            .unwrap();
+            assert_eq!(output, "0\n0\n", "flags {flags:?}");
+        }
+    }
+
+    #[test]
+    fn clock_is_opt_in() {
+        let script = "settle 10\nexpect y 0\n";
+        let (fails, output) = clocked_run(
+            &circuit(1),
+            PINS,
+            script,
+            &clocked_file(),
+            Mode::Redstone,
+            Default::default(),
+            false,
+        )
+        .unwrap();
+        assert_eq!((fails, output.as_str()), (0, ""));
+
+        let no_clock =
+            parse_server_file(r#"{"version":2,"schematic_size":[6,4,3],"probes":[]}"#).unwrap();
+        let result = clocked_run(
+            &circuit(1),
+            PINS,
+            script,
+            &no_clock,
+            Mode::Redstone,
+            Default::default(),
+            true,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn clock_must_be_a_lever_inside_the_schematic() {
+        for pos in ["[0,0,1]", "[6,0,0]"] {
+            let file = parse_server_file(&format!(
+                r#"{{"version":2,"schematic_size":[6,4,3],"probes":[],"clock":{{"pin":"clk","pos":{pos},"half_period_ticks":3}}}}"#
+            ))
+            .unwrap();
+            let result = clocked_run(
+                &circuit(1),
+                PINS,
+                "settle 1\n",
+                &file,
+                Mode::Redstone,
+                Default::default(),
+                true,
+            );
+            assert!(result.is_err(), "{pos}");
+        }
+    }
+
+    #[test]
+    fn clock_lever_that_drives_nothing_survives_optimization() {
+        let mut world = TestWorld::new(1, 1, 1);
+        world.set_block(BlockPos::new(0, 0, 0), Block::Stone {});
+        world.set_block(
+            BlockPos::new(0, 1, 0),
+            Block::Lever {
+                face: LeverFace::Floor,
+                facing: BlockDirection::North,
+                powered: false,
+            },
+        );
+        let origin = BlockPos::new(0, 0, 0);
+        let cb = create_clipboard(&mut world, origin, origin, BlockPos::new(0, 1, 0));
+        let file = parse_server_file(
+            r#"{"version":2,"schematic_size":[1,2,1],"probes":[],"clock":{"pin":"clk","pos":[0,1,0],"half_period_ticks":1}}"#,
+        )
+        .unwrap();
+        let (fails, _) = clocked_run(
+            &cb,
+            "",
+            "settle 4\n",
+            &file,
+            Mode::Redpiler,
+            CompilerOptions::parse("-oi"),
+            true,
+        )
+        .unwrap();
+        assert_eq!(fails, 0);
+    }
+
+    #[test]
+    fn compiled_probes_hold_under_every_flag() {
+        let probes = repeater_probe("rising", CONST_ON);
+        let script = "settle 2\nset a 1\nsettle 8\nset a 0\nsettle 1\nset a 1\nsettle 8\n";
+        for flags in FLAGS {
+            let options = CompilerOptions::parse(flags);
+            let output = probe_output_with(4, script, &probes, Mode::Redpiler, options).unwrap();
+            assert_eq!(output, "r=0\nr=1\n", "flags {flags:?}");
+        }
+    }
+
+    #[test]
+    fn compiled_probes_read_dust_under_every_flag() {
+        // The dust after the repeater has no sinks and is dropped by -o unless it is kept
+        let probes = parse_server_file(
+            r#"{"version":2,"schematic_size":[6,4,3],"probes":[{
+                "name":"t",
+                "format":[{"bits":[0],"radix":"d"},{"text":"\n"}],
+                "trigger":{"pos":[3,1,1],"edge":"rising"},
+                "enable":{"const":1},
+                "data":[{"pos":[2,1,1]}]
+            }]}"#,
+        )
+        .unwrap();
+        for flags in FLAGS {
+            let options = CompilerOptions::parse(flags);
+            let output = probe_output_with(
+                1,
+                "settle 2\nset a 1\nsettle 4\n",
+                &probes,
+                Mode::Redpiler,
+                options,
+            )
+            .unwrap();
+            assert_eq!(output, "1\n", "flags {flags:?}");
+        }
+    }
+
+    /// A torch that folds to on and a repeater it feeds through a lit torch's inverse, tapped with
+    /// no sinks. Neither has any input that can change, so `-o` makes both constants.
+    #[test]
+    fn compiled_probes_read_constant_nodes_under_every_flag() {
+        let mut world = TestWorld::new(1, 1, 1);
+        for x in 0..6 {
+            world.set_block(BlockPos::new(x, 0, 1), Block::Stone {});
+        }
+        // Saved with the wrong states, so reading the blocks instead of the nodes would be wrong
+        world.set_block(BlockPos::new(1, 1, 1), Block::RedstoneTorch { lit: false });
+        world.set_block(
+            BlockPos::new(2, 1, 1),
+            Block::Repeater(Repeater {
+                delay: 1,
+                facing: BlockDirection::West,
+                powered: false,
+                ..Default::default()
+            }),
+        );
+        world.set_block(BlockPos::new(4, 1, 1), Block::Stone {});
+        world.set_block(
+            BlockPos::new(4, 2, 1),
+            Block::Lever {
+                face: LeverFace::Floor,
+                facing: BlockDirection::North,
+                powered: false,
+            },
+        );
+        let origin = BlockPos::new(0, 0, 0);
+        let cb = create_clipboard(&mut world, origin, origin, BlockPos::new(5, 3, 2));
+        let probes = parse_server_file(
+            r#"{"version":2,"schematic_size":[6,4,3],"probes":[{
+                "name":"t",
+                "format":[{"bits":[0,1],"radix":"b"},{"text":"\n"}],
+                "trigger":{"pos":[4,2,1],"edge":"rising"},
+                "enable":{"pos":[1,1,1]},
+                "data":[{"pos":[1,1,1]},{"pos":[2,1,1]}]
+            }]}"#,
+        )
+        .unwrap();
+        let pins = parse_pins("a 3 1 1 1 0\n").unwrap();
+        let script = parse_script("settle 4\nset a 1\nsettle 4\n").unwrap();
+        for flags in FLAGS {
+            let mut out = Vec::new();
+            run_test_with_probes(
+                &cb,
+                &pins,
+                &script,
+                Mode::Redpiler,
+                &[],
+                CompilerOptions::parse(flags),
+                Some(&probes),
+                false,
+                &mut out,
+            )
+            .unwrap();
+            assert_eq!(String::from_utf8(out).unwrap(), "11\n", "flags {flags:?}");
+        }
+    }
+
+    /// A wall torch that is turned off through a repeater, with dust looping back around.
+    fn oscillator() -> (WorldEditClipboard, ServerFile) {
+        let mut world = TestWorld::new(1, 1, 1);
+        for x in 0..4 {
+            for z in 0..5 {
+                world.set_block(BlockPos::new(x, 0, z), Block::Stone {});
+            }
+        }
+        world.set_block(BlockPos::new(1, 1, 1), Block::Stone {});
+        world.set_block(
+            BlockPos::new(2, 1, 1),
+            Block::RedstoneWallTorch {
+                lit: true,
+                facing: BlockDirection::East,
+            },
+        );
+        for (x, z) in [(2, 2), (2, 3), (1, 3)] {
+            world.set_block(BlockPos::new(x, 1, z), Block::RedstoneWire(make_cross(0)));
+        }
+        world.set_block(
+            BlockPos::new(1, 1, 2),
+            Block::Repeater(Repeater {
+                delay: 3,
+                facing: BlockDirection::South,
+                ..Default::default()
+            }),
+        );
+        let origin = BlockPos::new(0, 0, 0);
+        let cb = create_clipboard(&mut world, origin, origin, BlockPos::new(3, 3, 4));
+        let probes = parse_server_file(
+            r#"{"version":2,"schematic_size":[4,4,5],"probes":[{
+                "name":"t",
+                "format":[],
+                "trigger":{"pos":[1,1,2],"edge":"rising"},
+                "enable":{"const":1},
+                "data":[{"pos":[2,1,1]},{"pos":[1,1,2]}]
+            }]}"#,
+        )
+        .unwrap();
+        (cb, probes)
+    }
+
+    fn compile_oscillator(flags: &str) -> (TestWorld, Compiler) {
+        let (cb, probes) = oscillator();
+        let mut world = paste(&cb);
+        update_all(&mut world, &cb);
+        let mut options = CompilerOptions::parse(flags);
+        options.probes = probes.specs(BASE);
+        let mut compiler = Compiler::default();
+        let max = BlockPos::new(
+            world.x_size * 16 - 1,
+            world.y_size * 16 - 1,
+            world.z_size * 16 - 1,
+        );
+        let ticks = world.to_be_ticked.clone();
+        compiler.compile(
+            &world,
+            (BlockPos::new(0, 0, 0), max),
+            options,
+            ticks,
+            Default::default(),
+        );
+        (world, compiler)
+    }
+
+    #[test]
+    fn hits_are_captured_at_tickn_speed() {
+        for flags in FLAGS {
+            let (_, mut one_at_a_time) = compile_oscillator(flags);
+            let mut expected = Vec::new();
+            for _ in 0..1000 {
+                one_at_a_time.tick();
+                one_at_a_time.drain_probe_hits(&mut expected);
+            }
+
+            let (_, mut batched) = compile_oscillator(flags);
+            batched.tickn(1000);
+            let mut hits = Vec::new();
+            batched.drain_probe_hits(&mut hits);
+
+            assert!(hits.len() > 50, "flags {flags:?} got {} hits", hits.len());
+            assert_eq!(hits, expected, "flags {flags:?}");
+            // The repeater has just turned on, and the torch hasn't reacted to it
+            assert!(hits.iter().all(|hit| hit.data == [true, true]), "{hits:?}");
+        }
+    }
+
+    #[test]
+    fn compiled_probes_match_polled_redstone() {
+        let (cb, probes) = oscillator();
+        let mut world = paste(&cb);
+        update_all(&mut world, &cb);
+        let mut poller = WorldPoller::new(probes.specs(BASE), &world);
+        let mut polled = Vec::new();
+        for _ in 0..1000 {
+            tick_redstone(&mut world);
+            poller.poll(&world, &mut polled);
+        }
+
+        let (_, mut compiler) = compile_oscillator("");
+        compiler.tickn(1000);
+        let mut hits = Vec::new();
+        compiler.drain_probe_hits(&mut hits);
+        assert_eq!(hits, polled);
     }
 
     #[test]

@@ -1315,6 +1315,7 @@ dependencies = [
  "itertools",
  "mchprs_blocks",
  "mchprs_network",
+ "mchprs_probes",
  "mchprs_proc_macros",
  "mchprs_redpiler",
  "mchprs_redstone",
@@ -1346,12 +1347,11 @@ dependencies = [
  "anyhow",
  "clap",
  "mchprs_blocks",
+ "mchprs_probes",
  "mchprs_redpiler",
  "mchprs_redstone",
  "mchprs_schematic",
  "mchprs_world",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -1366,6 +1366,17 @@ dependencies = [
  "mchprs_text",
  "serde",
  "tracing",
+]
+
+[[package]]
+name = "mchprs_probes"
+version = "0.5.2-dev"
+dependencies = [
+ "anyhow",
+ "mchprs_blocks",
+ "mchprs_world",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1388,6 +1399,7 @@ dependencies = [
  "indexmap",
  "itertools",
  "mchprs_blocks",
+ "mchprs_probes",
  "mchprs_redstone",
  "mchprs_world",
  "petgraph",

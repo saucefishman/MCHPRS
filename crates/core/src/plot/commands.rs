@@ -445,6 +445,7 @@ impl Plot {
             }
             "unwatch" => {
                 if self.schematic_watch.take().is_some() {
+                    self.clear_probes();
                     self.players[player].send_system_message("Stopped watching schematic.");
                 } else {
                     self.players[player].send_error_message("No schematic is being watched.");

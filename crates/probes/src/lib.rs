@@ -1,25 +1,34 @@
-//! Probes print sampled signals when a trigger block changes, like Verilog's `$write`. See the
-//! README for the file format.
+//! The file a build writes next to its schematic for the server to use. Probes print sampled
+//! signals when a trigger block changes, like Verilog's `$write`, and the clock toggles a lever
+//! on a fixed period. See the headless crate's README for the file format.
 
-use crate::{read_signal, BASE};
 use anyhow::{bail, ensure, Context, Result};
+use mchprs_blocks::blocks::Block;
 use mchprs_blocks::BlockPos;
-use mchprs_schematic::WorldEditClipboard;
-use mchprs_world::testing::TestWorld;
 use mchprs_world::World;
 use serde::Deserialize;
-use std::io::Write;
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 /// Fields are read into a `u128`
 const MAX_FIELD_BITS: usize = 128;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProbeFile {
+pub struct ServerFile {
     version: u32,
     schematic_size: [u32; 3],
     probes: Vec<Probe>,
+    clock: Option<Clock>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Clock {
+    /// Only used in messages
+    pin: String,
+    pos: [i32; 3],
+    /// In plot ticks, where a 1-delay repeater takes one tick
+    half_period_ticks: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,9 +48,9 @@ struct Trigger {
     edge: Edge,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum Edge {
+pub enum Edge {
     Rising,
     Falling,
 }
@@ -106,13 +115,20 @@ enum Radix {
     Char,
 }
 
-pub fn parse_probes(text: &str) -> Result<ProbeFile> {
-    let file: ProbeFile = serde_json::from_str(text).context("parsing probes")?;
+pub fn parse_server_file(text: &str) -> Result<ServerFile> {
+    let file: ServerFile = serde_json::from_str(text).context("parsing server file")?;
     ensure!(
         file.version == VERSION,
-        "probes version {} is not supported, expected {VERSION}",
+        "server file version {} is not supported, expected {VERSION}",
         file.version
     );
+    if let Some(clock) = &file.clock {
+        ensure!(
+            clock.half_period_ticks >= 1,
+            "clock {}: half_period_ticks must be at least 1",
+            clock.pin
+        );
+    }
     for probe in &file.probes {
         probe
             .check_format()
@@ -157,92 +173,204 @@ impl Probe {
     }
 }
 
-fn read(world: &TestWorld, [x, y, z]: [i32; 3]) -> Result<bool> {
-    let block = world.get_block(BASE + BlockPos::new(x, y, z));
-    read_signal(block).with_context(|| format!("{x} {y} {z} has no signal: {block:?}"))
+/// The signal a block outputs, or `None` if it isn't a block that probes can read
+pub fn read_signal(block: Block) -> Option<bool> {
+    Some(match block {
+        Block::Repeater(repeater) => repeater.powered,
+        Block::Comparator(comparator) => comparator.powered,
+        Block::RedstoneWire(wire) => wire.power > 0,
+        Block::RedstoneTorch { lit }
+        | Block::RedstoneWallTorch { lit, .. }
+        | Block::RedstoneLamp { lit } => lit,
+        Block::Lever { powered, .. } => powered,
+        _ => return None,
+    })
 }
 
-impl ProbeFile {
-    pub(crate) fn is_empty(&self) -> bool {
+/// A probe with world positions, which is what redpiler and [`WorldPoller`] run
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProbeSpec {
+    pub trigger: BlockPos,
+    pub edge: Edge,
+    pub enable: ProbeSource,
+    pub data: Vec<ProbeSource>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeSource {
+    Pos(BlockPos),
+    Const(bool),
+}
+
+/// A probe that fired, with its data captured at that moment
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProbeHit {
+    pub probe: u32,
+    pub data: Vec<bool>,
+}
+
+fn world_pos(origin: BlockPos, [x, y, z]: [i32; 3]) -> BlockPos {
+    origin + BlockPos::new(x, y, z)
+}
+
+fn inside(pos: [i32; 3], size: [u32; 3]) -> bool {
+    pos.iter().zip(size).all(|(&n, s)| n >= 0 && (n as u32) < s)
+}
+
+/// Counts ticks and says when to toggle the clock's lever
+#[derive(Clone, Debug)]
+pub struct ServerClock {
+    pos: BlockPos,
+    half_period_ticks: u32,
+    ticks_until_toggle: u32,
+}
+
+impl ServerClock {
+    pub fn pos(&self) -> BlockPos {
+        self.pos
+    }
+
+    pub fn ticks_until_toggle(&self) -> u32 {
+        self.ticks_until_toggle
+    }
+
+    /// Records `ticks` that have run, which must not be more than [`Self::ticks_until_toggle`].
+    /// Returns whether the lever should be toggled now.
+    pub fn advance(&mut self, ticks: u32) -> bool {
+        self.ticks_until_toggle -= ticks;
+        if self.ticks_until_toggle == 0 {
+            self.ticks_until_toggle = self.half_period_ticks;
+            return true;
+        }
+        false
+    }
+}
+
+impl ServerFile {
+    pub fn len(&self) -> usize {
+        self.probes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
         self.probes.is_empty()
     }
 
-    /// Checks the file against the schematic it is being run on. `world` must already have the
-    /// schematic pasted.
-    pub(crate) fn check(&self, cb: &WorldEditClipboard, world: &TestWorld) -> Result<()> {
-        let size = [cb.size_x, cb.size_y, cb.size_z];
+    /// Checks the file against the schematic it is being run on, which must already be pasted into
+    /// `world` with its minimum corner at `origin`.
+    pub fn check(&self, size: [u32; 3], world: &impl World, origin: BlockPos) -> Result<()> {
         ensure!(
             self.schematic_size == size,
             "probes are for a schematic of size {:?}, but this one is {size:?}",
             self.schematic_size
         );
         for probe in &self.probes {
-            for pos in probe.positions() {
-                read(world, pos).with_context(|| format!("probe {}", probe.name))?;
+            for [x, y, z] in probe.positions() {
+                ensure!(
+                    inside([x, y, z], size),
+                    "probe {}: {x} {y} {z} is outside the schematic",
+                    probe.name
+                );
+                let block = world.get_block(world_pos(origin, [x, y, z]));
+                ensure!(
+                    read_signal(block).is_some(),
+                    "probe {}: {x} {y} {z} has no signal: {block:?}",
+                    probe.name
+                );
             }
+        }
+        if let Some(clock) = &self.clock {
+            let [x, y, z] = clock.pos;
+            ensure!(
+                inside(clock.pos, size),
+                "clock {}: {x} {y} {z} is outside the schematic",
+                clock.pin
+            );
+            let block = world.get_block(world_pos(origin, clock.pos));
+            ensure!(
+                matches!(block, Block::Lever { .. }),
+                "clock {}: {x} {y} {z} is not a lever: {block:?}",
+                clock.pin
+            );
         }
         Ok(())
     }
-}
 
-/// Watches the probes' triggers and writes their output
-pub(crate) struct Poller<'a> {
-    probes: &'a [Probe],
-    last_trigger: Vec<bool>,
-    out: &'a mut dyn Write,
-}
-
-impl<'a> Poller<'a> {
-    /// A trigger that is already at its active level in `world` doesn't fire
-    pub(crate) fn new(
-        file: &'a ProbeFile,
-        world: &TestWorld,
-        out: &'a mut dyn Write,
-    ) -> Result<Poller<'a>> {
-        let last_trigger = file
-            .probes
+    pub fn specs(&self, origin: BlockPos) -> Vec<ProbeSpec> {
+        let source = |source: &Source| match source {
+            Source::Pos { pos } => ProbeSource::Pos(world_pos(origin, *pos)),
+            Source::Const { r#const } => ProbeSource::Const(*r#const != 0),
+        };
+        self.probes
             .iter()
-            .map(|probe| read(world, probe.trigger.pos))
-            .collect::<Result<_>>()?;
-        Ok(Poller {
-            probes: &file.probes,
-            last_trigger,
-            out,
+            .map(|probe| ProbeSpec {
+                trigger: world_pos(origin, probe.trigger.pos),
+                edge: probe.trigger.edge,
+                enable: source(&probe.enable),
+                data: probe.data.iter().map(source).collect(),
+            })
+            .collect()
+    }
+
+    /// The clock counting from now, so its first toggle is `half_period_ticks` away
+    pub fn clock(&self, origin: BlockPos) -> Option<ServerClock> {
+        self.clock.as_ref().map(|clock| ServerClock {
+            pos: world_pos(origin, clock.pos),
+            half_period_ticks: clock.half_period_ticks,
+            ticks_until_toggle: clock.half_period_ticks,
         })
+    }
+
+    /// The text a hit prints. This isn't always UTF-8, because `c` fields write raw bytes.
+    pub fn render(&self, hit: &ProbeHit) -> Vec<u8> {
+        render(&self.probes[hit.probe as usize].format, &hit.data)
+    }
+}
+
+/// Watches triggers by reading blocks from the world, for when redpiler isn't compiled
+pub struct WorldPoller {
+    specs: Vec<ProbeSpec>,
+    last_trigger: Vec<bool>,
+}
+
+fn read_or_low(world: &impl World, pos: BlockPos) -> bool {
+    // The block could have been replaced since the file was checked
+    read_signal(world.get_block(pos)).unwrap_or(false)
+}
+
+impl WorldPoller {
+    /// A trigger that is already at its active level in `world` doesn't fire
+    pub fn new(specs: Vec<ProbeSpec>, world: &impl World) -> WorldPoller {
+        let last_trigger = specs
+            .iter()
+            .map(|spec| read_or_low(world, spec.trigger))
+            .collect();
+        WorldPoller {
+            specs,
+            last_trigger,
+        }
     }
 
     /// Must run after every change to the world, because a probe samples whatever state it sees
     /// when its trigger changes. Polling any later could show values from after the edge.
-    pub(crate) fn poll(&mut self, world: &TestWorld) -> Result<()> {
-        let mut wrote = false;
-        for (probe, last) in self.probes.iter().zip(&mut self.last_trigger) {
-            let now = read(world, probe.trigger.pos)?;
-            let fired = match probe.trigger.edge {
+    pub fn poll(&mut self, world: &impl World, hits: &mut Vec<ProbeHit>) {
+        for (i, (spec, last)) in self.specs.iter().zip(&mut self.last_trigger).enumerate() {
+            let now = read_or_low(world, spec.trigger);
+            let fired = match spec.edge {
                 Edge::Rising => now && !*last,
                 Edge::Falling => !now && *last,
             };
             *last = now;
-            if fired && sample(&probe.enable, world)? {
-                let data = probe
-                    .data
-                    .iter()
-                    .map(|source| sample(source, world))
-                    .collect::<Result<Vec<_>>>()?;
-                self.out.write_all(&render(&probe.format, &data))?;
-                wrote = true;
+            let sample = |source: &ProbeSource| match source {
+                ProbeSource::Pos(pos) => read_or_low(world, *pos),
+                ProbeSource::Const(value) => *value,
+            };
+            if fired && sample(&spec.enable) {
+                hits.push(ProbeHit {
+                    probe: i as u32,
+                    data: spec.data.iter().map(sample).collect(),
+                });
             }
         }
-        if wrote {
-            self.out.flush()?;
-        }
-        Ok(())
-    }
-}
-
-fn sample(source: &Source, world: &TestWorld) -> Result<bool> {
-    match source {
-        Source::Pos { pos } => read(world, *pos),
-        Source::Const { r#const } => Ok(*r#const != 0),
     }
 }
 
@@ -384,7 +512,34 @@ mod tests {
     }
 
     fn probe_file(probe: &str) -> String {
-        format!(r#"{{"version":1,"schematic_size":[1,1,1],"probes":[{probe}]}}"#)
+        format!(r#"{{"version":2,"schematic_size":[1,1,1],"probes":[{probe}]}}"#)
+    }
+
+    #[test]
+    fn clock_toggles_every_half_period() {
+        let file = parse_server_file(
+            r#"{"version":2,"schematic_size":[1,1,1],"probes":[],"clock":{"pin":"clk","pos":[0,0,0],"half_period_ticks":3}}"#,
+        )
+        .unwrap();
+        let mut clock = file.clock(BlockPos::new(0, 0, 0)).unwrap();
+        assert_eq!(clock.ticks_until_toggle(), 3);
+        assert!(!clock.advance(2));
+        assert_eq!(clock.ticks_until_toggle(), 1);
+        assert!(clock.advance(1));
+        assert_eq!(clock.ticks_until_toggle(), 3);
+        assert!(clock.advance(3));
+    }
+
+    #[test]
+    fn bad_clocks_are_rejected() {
+        let clock = |half_period: &str| {
+            format!(
+                r#"{{"version":2,"schematic_size":[1,1,1],"probes":[],"clock":{{"pin":"clk","pos":[0,0,0],"half_period_ticks":{half_period}}}}}"#
+            )
+        };
+        assert!(parse_server_file(&clock("1")).is_ok());
+        assert!(parse_server_file(&clock("0")).is_err());
+        assert!(parse_server_file(&clock("-1")).is_err());
     }
 
     #[test]
@@ -393,11 +548,11 @@ mod tests {
         let good = format!(
             r#"{{"name":"a","format":[{{"text":"x"}}],{trigger},"enable":{{"const":1}},"data":[]}}"#
         );
-        assert!(parse_probes(&probe_file(&good)).is_ok());
+        assert!(parse_server_file(&probe_file(&good)).is_ok());
 
-        assert!(parse_probes("{}").is_err());
-        let wrong_version = probe_file(&good).replace(r#""version":1"#, r#""version":2"#);
-        assert!(parse_probes(&wrong_version).is_err());
+        assert!(parse_server_file("{}").is_err());
+        let wrong_version = probe_file(&good).replace(r#""version":2"#, r#""version":1"#);
+        assert!(parse_server_file(&wrong_version).is_err());
         for bad in [
             good.replace(r#""const":1"#, r#""const":2"#),
             good.replace("rising", "sideways"),
@@ -410,7 +565,7 @@ mod tests {
             ),
             good.replace(r#"{"text":"x"}"#, r#"{"bits":[0],"radix":"d","pad":"ab"}"#),
         ] {
-            assert!(parse_probes(&probe_file(&bad)).is_err(), "{bad}");
+            assert!(parse_server_file(&probe_file(&bad)).is_err(), "{bad}");
         }
     }
 }

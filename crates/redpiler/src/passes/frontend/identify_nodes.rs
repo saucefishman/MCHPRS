@@ -9,7 +9,7 @@
 
 use crate::compile_graph::{Annotations, CompileGraph, CompileNode, NodeIdx, NodeState, NodeType};
 use crate::passes::{AnalysisInfos, Pass};
-use crate::{CompilerInput, CompilerOptions};
+use crate::{probe_positions, CompilerInput, CompilerOptions};
 use itertools::Itertools;
 use mchprs_blocks::block_entities::BlockEntity;
 use mchprs_blocks::blocks::Block;
@@ -33,6 +33,9 @@ impl<W: World> Pass<W> for IdentifyNodes {
     ) {
         let ignore_wires = options.optimize;
         let plot = input.world;
+        let probed: FxHashSet<BlockPos> = probe_positions(options)
+            .chain(options.keep.iter().copied())
+            .collect();
 
         let mut first_pass = FxHashMap::default();
         let mut second_pass = FxHashSet::default();
@@ -46,6 +49,7 @@ impl<W: World> Pass<W> for IdentifyNodes {
                 &mut second_pass,
                 ignore_wires,
                 options.wire_dot_out,
+                &probed,
                 plot,
                 pos,
             );
@@ -71,6 +75,7 @@ fn for_pos<W: World>(
     second_pass: &mut FxHashSet<BlockPos>,
     ignore_wires: bool,
     wire_dot_out: bool,
+    probed: &FxHashSet<BlockPos>,
     world: &W,
     pos: BlockPos,
 ) {
@@ -88,7 +93,8 @@ fn for_pos<W: World>(
 
     let is_input = ty.is_normally_input();
     let is_output = ty.is_normally_output()
-        || matches!(block, Block::RedstoneWire(wire) if wire_dot_out && wire::is_dot(wire));
+        || matches!(block, Block::RedstoneWire(wire) if wire_dot_out && wire::is_dot(wire))
+        || probed.contains(&pos);
 
     if ignore_wires && ty == NodeType::Wire && !(is_input | is_output) {
         return;

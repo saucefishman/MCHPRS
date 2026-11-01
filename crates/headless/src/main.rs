@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use mchprs_headless::{
-    parse_cuts, parse_pins, parse_probes, parse_script, run_test_with_probes, settle, Mode,
+    parse_cuts, parse_pins, parse_script, parse_server_file, run_test_with_probes, settle, Mode,
 };
+use mchprs_redpiler::CompilerOptions;
 use mchprs_schematic::load_schematic;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -27,9 +28,15 @@ enum Command {
         /// Place a stone and lever at this pin before running
         #[arg(long = "add-lever", value_name = "NAME")]
         add_levers: Vec<String>,
-        /// JSON file of signals to print when their triggers change
+        /// Redpiler compile flags, such as "-oi"
+        #[arg(long, default_value = "", allow_hyphen_values = true)]
+        redpiler_flags: String,
+        /// Server file (<name>.server.json) of signals to print when their triggers change
         #[arg(long)]
         probes: Option<PathBuf>,
+        /// Toggle the lever of the clock in the --probes file as the script ticks
+        #[arg(long, requires = "probes")]
+        run_clock: bool,
     },
     /// Run a schematic until nothing is pending and write its signal block states
     Settle {
@@ -56,14 +63,18 @@ fn run(args: Args) -> Result<ExitCode> {
             script,
             modes,
             add_levers,
+            redpiler_flags,
             probes,
+            run_clock,
         } => {
             let cb =
                 load_schematic(&schem).with_context(|| format!("loading {}", schem.display()))?;
             let pins = parse_pins(&read(&pins)?)?;
             let script = parse_script(&read(&script)?)?;
             let probes = probes
-                .map(|path| parse_probes(&read(&path)?).with_context(|| path.display().to_string()))
+                .map(|path| {
+                    parse_server_file(&read(&path)?).with_context(|| path.display().to_string())
+                })
                 .transpose()?;
             let mut fails = 0;
             for mode in modes {
@@ -73,7 +84,9 @@ fn run(args: Args) -> Result<ExitCode> {
                     &script,
                     mode,
                     &add_levers,
+                    CompilerOptions::parse(&redpiler_flags),
                     probes.as_ref(),
+                    run_clock,
                     &mut std::io::stdout(),
                 )?;
             }

@@ -21,6 +21,7 @@ mchprs_world = { path = "../world" }
 mchprs_utils = { path = "../utils" }
 mchprs_network = { path = "../network" }
 mchprs_text = { path = "../text" }
+mchprs_probes = { path = "../probes" }
 mchprs_redpiler = { path = "../redpiler" }
 mchprs_redstone = { path = "../redstone" }
 mchprs_schematic = { path = "../schematic" }

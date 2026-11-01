@@ -1,6 +1,8 @@
 //! Watches a schematic file and automatically pastes it into the plot whenever it changes.
 //! The schematic is centered horizontally in the plot and placed on top of the plot floor.
+//! A server file next to the schematic is watched and reloaded with it.
 
+use super::probes::server_file_path;
 use super::{worldedit, Plot, PLOT_BLOCK_HEIGHT, PLOT_BLOCK_WIDTH};
 use crate::player::PacketSender;
 use mchprs_blocks::BlockPos;
@@ -8,7 +10,7 @@ use mchprs_redpiler::CompilerOptions;
 use mchprs_schematic::{load_schematic, paste_clipboard};
 use mchprs_world::World;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 use tracing::error;
 
@@ -17,16 +19,27 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// The lowest y level above the generated plot floor
 const FLOOR_Y: i32 = 8;
 
+/// The modification times of the schematic and its server file, if it has one
+type WatchedTimes = (SystemTime, Option<SystemTime>);
+
+fn watched_times(path: &Path) -> Option<WatchedTimes> {
+    let schematic = fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    let probes = fs::metadata(server_file_path(path))
+        .and_then(|m| m.modified())
+        .ok();
+    Some((schematic, probes))
+}
+
 pub struct SchematicWatch {
     pub path: PathBuf,
     /// If set, redpiler is compiled with these options after every reload
     pub compile_options: Option<CompilerOptions>,
-    /// The modification time of the last loaded version of the file
-    loaded_mtime: Option<SystemTime>,
-    /// A modification time that has been seen but not loaded yet. The file is only loaded once
-    /// its modification time has been stable for one poll, so that partially written files
+    /// The modification times of the last loaded versions of the files
+    loaded_mtime: Option<WatchedTimes>,
+    /// Modification times that have been seen but not loaded yet. The files are only loaded once
+    /// their modification times have been stable for one poll, so that partially written files
     /// aren't loaded.
-    pending_mtime: Option<SystemTime>,
+    pending_mtime: Option<WatchedTimes>,
     /// The region the last version was pasted into, which is cleared before the next paste
     last_bounds: Option<(BlockPos, BlockPos)>,
     last_check: Instant,
@@ -34,7 +47,7 @@ pub struct SchematicWatch {
 
 impl SchematicWatch {
     pub fn new(path: PathBuf, compile_options: Option<CompilerOptions>) -> SchematicWatch {
-        let loaded_mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
+        let loaded_mtime = watched_times(&path);
         SchematicWatch {
             path,
             compile_options,
@@ -65,7 +78,7 @@ impl Plot {
         }
         watch.last_check = Instant::now();
 
-        let Ok(mtime) = fs::metadata(&watch.path).and_then(|m| m.modified()) else {
+        let Some(mtime) = watched_times(&watch.path) else {
             return;
         };
         if Some(mtime) == watch.loaded_mtime {
@@ -113,7 +126,9 @@ impl Plot {
 
         let last_bounds = watch.last_bounds;
         let compile_options = watch.compile_options.clone();
+        let schematic_path = watch.path.clone();
 
+        self.finish_probe_output();
         self.reset_redpiler();
 
         let (plot_min, plot_max) = self.world.get_corners();
@@ -154,6 +169,13 @@ impl Plot {
         let fits = cb.size_x as i32 <= PLOT_BLOCK_WIDTH
             && cb.size_y as i32 <= max_height
             && cb.size_z as i32 <= PLOT_BLOCK_WIDTH;
+
+        self.load_watched_probes(
+            &schematic_path,
+            [cb.size_x, cb.size_y, cb.size_z],
+            first_pos,
+            fits,
+        );
 
         if let Some(options) = compile_options {
             self.start_redpiler(options);
