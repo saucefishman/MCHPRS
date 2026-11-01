@@ -30,7 +30,7 @@ impl ServerBoundPacketHandler for Plot {
         packet: SCommandSuggestionsRequest,
         player_idx: usize,
     ) {
-        let Some(current) = ["//load ", "/watch "]
+        let Some(current) = ["//load ", "/watch ", "/load "]
             .iter()
             .find_map(|prefix| packet.text.strip_prefix(prefix))
         else {

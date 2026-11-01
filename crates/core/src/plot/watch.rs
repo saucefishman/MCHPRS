@@ -34,6 +34,8 @@ pub struct SchematicWatch {
     pub path: PathBuf,
     /// If set, redpiler is compiled with these options after every reload
     pub compile_options: Option<CompilerOptions>,
+    /// If false, the file is only loaded once and changes are not picked up
+    polling: bool,
     /// The modification times of the last loaded versions of the files
     loaded_mtime: Option<WatchedTimes>,
     /// Modification times that have been seen but not loaded yet. The files are only loaded once
@@ -46,11 +48,16 @@ pub struct SchematicWatch {
 }
 
 impl SchematicWatch {
-    pub fn new(path: PathBuf, compile_options: Option<CompilerOptions>) -> SchematicWatch {
+    pub fn new(
+        path: PathBuf,
+        compile_options: Option<CompilerOptions>,
+        polling: bool,
+    ) -> SchematicWatch {
         let loaded_mtime = watched_times(&path);
         SchematicWatch {
             path,
             compile_options,
+            polling,
             loaded_mtime,
             pending_mtime: None,
             last_bounds: None,
@@ -62,6 +69,10 @@ impl SchematicWatch {
 impl SchematicWatch {
     /// Forgets the region the last version was pasted into, so it won't be cleared on the next
     /// reload
+    pub fn inherit_last_bounds(&mut self, other: &SchematicWatch) {
+        self.last_bounds = other.last_bounds;
+    }
+
     pub fn forget_last_bounds(&mut self) {
         self.last_bounds = None;
     }
@@ -73,7 +84,7 @@ impl Plot {
         let Some(watch) = &mut self.schematic_watch else {
             return;
         };
-        if watch.last_check.elapsed() < POLL_INTERVAL {
+        if !watch.polling || watch.last_check.elapsed() < POLL_INTERVAL {
             return;
         }
         watch.last_check = Instant::now();

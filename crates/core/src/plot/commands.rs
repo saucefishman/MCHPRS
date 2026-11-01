@@ -409,18 +409,18 @@ impl Plot {
             "stop" => {
                 let _ = self.message_sender.send(Message::Shutdown);
             }
-            "watch" => {
+            "watch" | "load" => {
+                let watching = command == "watch";
+                let usage = format!("Usage: /{} <filename> [-c [redpiler options]]", command);
                 let Some(file_name) = args.first() else {
-                    self.players[player]
-                        .send_error_message("Usage: /watch <filename> [-c [redpiler options]]");
+                    self.players[player].send_error_message(&usage);
                     return false;
                 };
                 let compile_options = match args.get(1) {
                     None => None,
                     Some(&"-c") => Some(CompilerOptions::parse(&args[2..].join(" "))),
                     Some(_) => {
-                        self.players[player]
-                            .send_error_message("Usage: /watch <filename> [-c [redpiler options]]");
+                        self.players[player].send_error_message(&usage);
                         return false;
                     }
                 };
@@ -430,11 +430,24 @@ impl Plot {
                     return false;
                 };
                 let exists = path.exists();
-                self.schematic_watch = Some(SchematicWatch::new(path, compile_options));
-                self.players[player].send_system_message(&format!(
-                    "Watching {}. It will be pasted in the center of this plot whenever it changes.",
-                    file_name
-                ));
+                if !watching && !exists {
+                    self.players[player].send_error_message("Schematic doesn't exist");
+                    return false;
+                }
+                let mut watch = SchematicWatch::new(path, compile_options, watching);
+                if !watching {
+                    // Replace what the previous load or watch pasted
+                    if let Some(old) = &self.schematic_watch {
+                        watch.inherit_last_bounds(old);
+                    }
+                }
+                self.schematic_watch = Some(watch);
+                if watching {
+                    self.players[player].send_system_message(&format!(
+                        "Watching {}. It will be pasted in the center of this plot whenever it changes.",
+                        file_name
+                    ));
+                }
                 if exists {
                     self.reload_watched_schematic();
                 } else {
@@ -728,7 +741,7 @@ pub static DECLARE_COMMANDS: LazyLock<PacketEncoder> = LazyLock::new(|| {
                 flags: CommandFlags::ROOT.bits() as i8,
                 children: vec![
                     1, 4, 5, 6, 8, 10, 11, 13, 18, 30, 34, 41, 43, 44, 45, 49, 51, 52, 53, 56, 60,
-                    63,
+                    63, 66,
                 ],
                 redirect_node: None,
                 name: None,
@@ -1324,6 +1337,36 @@ pub static DECLARE_COMMANDS: LazyLock<PacketEncoder> = LazyLock::new(|| {
                 redirect_node: None,
                 name: Some("confirm"),
                 parser: None,
+                suggestions_type: None,
+            },
+            // 66: /load
+            Node {
+                flags: CommandFlags::LITERAL.bits() as i8,
+                children: vec![67],
+                redirect_node: None,
+                name: Some("load"),
+                parser: None,
+                suggestions_type: None,
+            },
+            // 67: /load <filename>
+            Node {
+                flags: (CommandFlags::ARGUMENT
+                    | CommandFlags::EXECUTABLE
+                    | CommandFlags::HAS_SUGGESTIONS_TYPE)
+                    .bits() as i8,
+                children: vec![68],
+                redirect_node: None,
+                name: Some("filename"),
+                parser: Some(Parser::String(0)),
+                suggestions_type: Some("minecraft:ask_server"),
+            },
+            // 68: /load <filename> [options]
+            Node {
+                flags: (CommandFlags::ARGUMENT | CommandFlags::EXECUTABLE).bits() as i8,
+                children: vec![],
+                redirect_node: None,
+                name: Some("options"),
+                parser: Some(Parser::String(2)),
                 suggestions_type: None,
             },
         ],
