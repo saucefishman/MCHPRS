@@ -43,7 +43,7 @@ use self::scoreboard::Scoreboard;
 use self::watch::SchematicWatch;
 
 /// The width of a plot (2^n)
-pub const PLOT_SCALE: u32 = 5;
+pub const PLOT_SCALE: u32 = 6;
 
 /// The width of a plot counted in chunks
 pub const PLOT_WIDTH: i32 = 2i32.pow(PLOT_SCALE);
