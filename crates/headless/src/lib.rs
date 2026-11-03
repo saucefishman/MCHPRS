@@ -352,7 +352,7 @@ pub fn run_test_with_probes(
             world.z_size * 16 - 1,
         );
         let bounds = (BlockPos::new(0, 0, 0), max);
-        let ticks = world.to_be_ticked.clone();
+        let ticks = world.to_be_ticked().to_vec();
         compiler.compile(&world, bounds, options, ticks, Default::default());
         compiler
     });
@@ -435,7 +435,7 @@ pub fn settle(cb: &WorldEditClipboard, cuts: &[BlockPos], max_ticks: u32) -> Set
     }
     update_all(&mut world, cb);
     let mut ticks = 0;
-    while !world.to_be_ticked.is_empty() && ticks < max_ticks {
+    while !world.to_be_ticked().is_empty() && ticks < max_ticks {
         tick_redstone(&mut world);
         ticks += 1;
     }
@@ -460,7 +460,7 @@ pub fn settle(cb: &WorldEditClipboard, cuts: &[BlockPos], max_ticks: u32) -> Set
     }
     SettleResult {
         ticks,
-        pending: world.to_be_ticked.len(),
+        pending: world.to_be_ticked().len(),
         states,
     }
 }
@@ -962,7 +962,7 @@ mod tests {
             world.y_size * 16 - 1,
             world.z_size * 16 - 1,
         );
-        let ticks = world.to_be_ticked.clone();
+        let ticks = world.to_be_ticked().to_vec();
         compiler.compile(
             &world,
             (BlockPos::new(0, 0, 0), max),

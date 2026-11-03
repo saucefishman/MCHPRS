@@ -6,7 +6,9 @@ use rustc_hash::FxHashMap;
 #[derive(Clone)]
 pub struct TestWorld {
     pub chunks: Vec<Chunk>,
-    pub to_be_ticked: Vec<TickEntry>,
+    /// Private so that `pending_at` stays in step with it. Read it with
+    /// [`TestWorld::to_be_ticked`] and run it with [`TestWorld::run_due_ticks`].
+    to_be_ticked: Vec<TickEntry>,
     /// How many entries of `to_be_ticked` are at each position, so `pending_tick_at` doesn't have
     /// to scan them
     pending_at: FxHashMap<BlockPos, u32>,
@@ -35,6 +37,11 @@ impl TestWorld {
             y_size,
             z_size,
         }
+    }
+
+    /// The ticks still pending, in no particular order
+    pub fn to_be_ticked(&self) -> &[TickEntry] {
+        &self.to_be_ticked
     }
 
     /// Advances the pending ticks by one game tick, calling `tick` on each one that is due. Ticks

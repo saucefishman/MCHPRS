@@ -22,7 +22,7 @@ impl RedpilerInstance {
         let max_z = world.z_size * 16 - 1;
         let bounds = (BlockPos::new(0, 0, 0), BlockPos::new(max_x, max_y, max_z));
         let monitor = Default::default();
-        let ticks = world.to_be_ticked.clone();
+        let ticks = world.to_be_ticked().to_vec();
         compiler.compile(world, bounds, options.clone(), ticks, monitor);
         RedpilerInstance { options, compiler }
     }
@@ -61,15 +61,7 @@ impl BackendRunner {
         }
 
         self.world
-            .to_be_ticked
-            .sort_by_key(|e| (e.ticks_left, e.tick_priority));
-        for pending in &mut self.world.to_be_ticked {
-            pending.ticks_left = pending.ticks_left.saturating_sub(1);
-        }
-        while self.world.to_be_ticked.first().map_or(1, |e| e.ticks_left) == 0 {
-            let entry = self.world.to_be_ticked.remove(0);
-            mchprs_redstone::tick(self.world.get_block(entry.pos), &mut self.world, entry.pos);
-        }
+            .run_due_ticks(|world, pos| mchprs_redstone::tick(world.get_block(pos), world, pos));
     }
 
     pub fn use_block(&mut self, pos: BlockPos) {
