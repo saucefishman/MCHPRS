@@ -1,11 +1,15 @@
 use crate::{storage::Chunk, TickEntry, TickPriority, World};
 use mchprs_blocks::{block_entities::BlockEntity, BlockPos};
+use rustc_hash::FxHashMap;
 
 /// A reference world implementation used for testing.
 #[derive(Clone)]
 pub struct TestWorld {
     pub chunks: Vec<Chunk>,
     pub to_be_ticked: Vec<TickEntry>,
+    /// How many entries of `to_be_ticked` are at each position, so `pending_tick_at` doesn't have
+    /// to scan them
+    pending_at: FxHashMap<BlockPos, u32>,
     /// The size in chunks on the X azis.
     pub x_size: i32,
     /// The size in chunk sections on the Y azis.
@@ -26,10 +30,35 @@ impl TestWorld {
         TestWorld {
             chunks,
             to_be_ticked: Vec::new(),
+            pending_at: FxHashMap::default(),
             x_size,
             y_size,
             z_size,
         }
+    }
+
+    /// Advances the pending ticks by one game tick, calling `tick` on each one that is due. Ticks
+    /// run in order of priority, then in the order they were scheduled.
+    pub fn run_due_ticks(&mut self, mut tick: impl FnMut(&mut TestWorld, BlockPos)) {
+        self.to_be_ticked
+            .sort_by_key(|e| (e.ticks_left, e.tick_priority));
+        for pending in &mut self.to_be_ticked {
+            pending.ticks_left = pending.ticks_left.saturating_sub(1);
+        }
+        // Entries stay in the list until the end, but no longer count as pending once they've run
+        let mut ran = 0;
+        while self.to_be_ticked.get(ran).map_or(1, |e| e.ticks_left) == 0 {
+            let pos = self.to_be_ticked[ran].pos;
+            ran += 1;
+            if let Some(count) = self.pending_at.get_mut(&pos) {
+                *count -= 1;
+                if *count == 0 {
+                    self.pending_at.remove(&pos);
+                }
+            }
+            tick(self, pos);
+        }
+        self.to_be_ticked.drain(..ran);
     }
 
     fn get_chunk_index_for_chunk(&self, chunk_x: i32, chunk_z: i32) -> usize {
@@ -112,6 +141,7 @@ impl World for TestWorld {
     }
 
     fn schedule_tick(&mut self, pos: BlockPos, delay: u32, priority: TickPriority) {
+        *self.pending_at.entry(pos).or_insert(0) += 1;
         self.to_be_ticked.push(TickEntry {
             pos,
             ticks_left: delay,
@@ -120,6 +150,6 @@ impl World for TestWorld {
     }
 
     fn pending_tick_at(&mut self, pos: BlockPos) -> bool {
-        self.to_be_ticked.iter().any(|e| e.pos == pos)
+        self.pending_at.contains_key(&pos)
     }
 }

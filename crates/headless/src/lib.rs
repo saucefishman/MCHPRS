@@ -161,16 +161,7 @@ fn update_all(world: &mut TestWorld, cb: &WorldEditClipboard) {
 }
 
 fn tick_redstone(world: &mut TestWorld) {
-    world
-        .to_be_ticked
-        .sort_by_key(|e| (e.ticks_left, e.tick_priority));
-    for pending in &mut world.to_be_ticked {
-        pending.ticks_left = pending.ticks_left.saturating_sub(1);
-    }
-    while world.to_be_ticked.first().map_or(1, |e| e.ticks_left) == 0 {
-        let entry = world.to_be_ticked.remove(0);
-        mchprs_redstone::tick(world.get_block(entry.pos), world, entry.pos);
-    }
+    world.run_due_ticks(|world, pos| mchprs_redstone::tick(world.get_block(pos), world, pos));
 }
 
 struct ProbeOutput<'a> {
@@ -208,7 +199,6 @@ impl Runner<'_> {
     fn tick(&mut self) -> Result<()> {
         if let Some(compiler) = &mut self.compiler {
             compiler.tick();
-            compiler.flush(&mut self.world);
         } else {
             tick_redstone(&mut self.world);
         }
@@ -225,7 +215,6 @@ impl Runner<'_> {
     fn toggle(&mut self, pos: BlockPos) -> Result<()> {
         if let Some(compiler) = &mut self.compiler {
             compiler.on_use_block(pos);
-            compiler.flush(&mut self.world);
         } else {
             mchprs_redstone::on_use(self.world.get_block(pos), &mut self.world, pos);
         }
@@ -237,6 +226,14 @@ impl Runner<'_> {
             self.tick()?;
         }
         Ok(())
+    }
+
+    /// Writes redpiler's state to the world. This scans every node, so it's only done before the
+    /// world is read rather than on every tick.
+    fn sync_world(&mut self) {
+        if let Some(compiler) = &mut self.compiler {
+            compiler.flush(&mut self.world);
+        }
     }
 
     fn read(&self, name: &str, pos: BlockPos) -> Result<bool> {
@@ -383,6 +380,7 @@ pub fn run_test_with_probes(
             ScriptCommand::Settle(ticks) => runner.run_ticks(*ticks)?,
             ScriptCommand::Set(name, value) => {
                 let lever = inputs[name.as_str()];
+                runner.sync_world();
                 let on = matches!(
                     runner.world.get_block(lever),
                     Block::Lever { powered: true, .. }
@@ -398,6 +396,7 @@ pub fn run_test_with_probes(
                 runner.toggle(lever)?;
             }
             ScriptCommand::Expect(name, want) => {
+                runner.sync_world();
                 let got = runner.read(name, outputs[name.as_str()])?;
                 if got != *want {
                     println!(
@@ -408,6 +407,7 @@ pub fn run_test_with_probes(
                 }
             }
             ScriptCommand::Print(text) => {
+                runner.sync_world();
                 let mut values = Vec::new();
                 for (name, pos) in &outputs {
                     values.push(format!("{name}={}", runner.read(name, *pos)? as u8));
