@@ -91,6 +91,9 @@ pub struct Plot {
     /// If true, the plot will remain running even if no players are on for a long time.
     always_running: bool,
     auto_redpiler: bool,
+    /// Set with `/rtps halfclock`. While redpiler is compiled and the server file has a clock,
+    /// whole half periods run in one batch with a single flush, see [`Plot::run_half_clock`].
+    half_clock: Option<HalfClockStats>,
 
     owner: Option<u128>,
     async_rt: Runtime,
@@ -271,6 +274,13 @@ impl World for PlotWorld {
     }
 }
 
+/// Progress of `/rtps halfclock` since it was turned on
+struct HalfClockStats {
+    since: Instant,
+    half_periods: u64,
+    ticks: u64,
+}
+
 impl Plot {
     fn tickn(&mut self, ticks: u64) {
         if self.redpiler.is_active() {
@@ -313,6 +323,89 @@ impl Plot {
         }
         self.poll_world_probes();
         self.advance_clock(1);
+    }
+
+    /// Runs the rest of the clock's half period as one batch if its wall time at the target rtps
+    /// has passed, then flushes once. The lever toggles at the end, so the next call starts a new
+    /// half period, and commands and players act between half periods. Ticks are the same as
+    /// running them one batch at a time, so probes print what headless `--run-clock` prints.
+    fn run_half_clock(&mut self) {
+        let Some(ticks) = self.clock_ticks_until_toggle() else {
+            return;
+        };
+        match self.tps {
+            Tps::Limited(tps) if tps != 0 => {
+                let wall_time = Duration::from_nanos(1_000_000_000 / tps as u64) * ticks;
+                if self.lag_time < wall_time {
+                    return;
+                }
+                // Running behind doesn't build up a backlog to catch up on
+                self.lag_time = (self.lag_time - wall_time).min(wall_time);
+            }
+            Tps::Unlimited => {}
+            _ => return,
+        }
+        let start = Instant::now();
+        self.tickn(ticks as u64);
+        self.redpiler.flush(&mut self.world);
+        self.last_nspt = Some(start.elapsed() / ticks);
+        if let Some(stats) = &mut self.half_clock {
+            stats.half_periods += 1;
+            stats.ticks += ticks as u64;
+        }
+    }
+
+    /// Turns `/rtps halfclock` on or off, and returns the message for the player
+    fn set_half_clock(&mut self, on: bool) -> String {
+        if !on {
+            return match self.half_clock.take() {
+                Some(_) => "Half clock mode is off".to_string(),
+                None => "Half clock mode was already off".to_string(),
+            };
+        }
+        if self.half_clock.is_none() {
+            self.half_clock = Some(HalfClockStats {
+                since: Instant::now(),
+                half_periods: 0,
+                ticks: 0,
+            });
+            self.lag_time = Duration::ZERO;
+        }
+        let mut msg = "Half clock mode is on: each half clock period runs at once".to_string();
+        if self.clock_ticks_until_toggle().is_none() {
+            msg += ". It waits for a server file with a clock";
+        }
+        if !self.redpiler.is_active() {
+            msg += ". It waits for redpiler to be compiled";
+        }
+        msg
+    }
+
+    /// Progress since `/rtps halfclock` was turned on, for `/rtps`
+    fn half_clock_status(&self) -> Option<String> {
+        let stats = self.half_clock.as_ref()?;
+        let state = if self.half_clock_can_run() {
+            "running"
+        } else {
+            "waiting for redpiler and a clock"
+        };
+        let elapsed = stats.since.elapsed().as_secs_f64();
+        let rtps = if elapsed > 0.0 {
+            stats.ticks as f64 / elapsed
+        } else {
+            0.0
+        };
+        Some(format!(
+            "Half clock: {}, {} half periods in {:.0}s, {:.0} rtps on average",
+            state, stats.half_periods, elapsed, rtps
+        ))
+    }
+
+    /// Whether `/rtps halfclock` is on and can run: redpiler is compiled and there's a clock
+    fn half_clock_can_run(&self) -> bool {
+        self.half_clock.is_some()
+            && self.redpiler.is_active()
+            && self.clock_ticks_until_toggle().is_some()
     }
 
     /// What is likely to limit the plot's rtps, for lag messages and `/rtps`
@@ -1108,7 +1201,13 @@ impl Plot {
                 }
             };
 
+            let half_clock = self.half_clock_can_run();
             let batch_size = match self.tps {
+                // Half clock mode keeps the lag to time whole half periods
+                _ if half_clock => {
+                    self.lag_time += now - self.last_update_time;
+                    0
+                }
                 Tps::Limited(tps) if tps != 0 => {
                     let dur_per_tick = Duration::from_nanos(1_000_000_000 / tps as u64);
                     self.lag_time += now - self.last_update_time;
@@ -1121,7 +1220,9 @@ impl Plot {
             };
 
             self.last_update_time = now;
-            if batch_size != 0 {
+            if half_clock {
+                self.run_half_clock();
+            } else if batch_size != 0 {
                 // 50_000 (= 3.33 MHz) here is arbitrary.
                 // We just need a number that's not too high so we actually get around to sending
                 // block updates.
@@ -1256,6 +1357,7 @@ impl Plot {
             locked_players: HashSet::new(),
             running: true,
             auto_redpiler: CONFIG.auto_redpiler,
+            half_clock: None,
             tps,
             world_send_rate,
             always_running,

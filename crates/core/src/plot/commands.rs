@@ -310,12 +310,33 @@ impl Plot {
                         self.players[player].send_chat_message(&TextComponent::from_legacy_text(
                             &format!("&6Limit: &a{}", self.rtps_limit()),
                         ));
+                        if let Some(status) = self.half_clock_status() {
+                            self.players[player].send_chat_message(
+                                &TextComponent::from_legacy_text(&format!("&6{}", status)),
+                            );
+                        }
                     } else {
                         self.players[player].send_chat_message(&TextComponent::from_legacy_text(
                             &format!("&6No timings data. &a({})", self.tps),
                         ));
                     }
 
+                    return false;
+                }
+
+                if args[0] == "halfclock" {
+                    let on = match args.get(1).copied() {
+                        None => self.half_clock.is_none(),
+                        Some("on") => true,
+                        Some("off") => false,
+                        Some(_) => {
+                            self.players[player]
+                                .send_error_message("Usage: /rtps halfclock [on|off]");
+                            return false;
+                        }
+                    };
+                    let msg = self.set_half_clock(on);
+                    self.players[player].send_system_message(&msg);
                     return false;
                 }
 
