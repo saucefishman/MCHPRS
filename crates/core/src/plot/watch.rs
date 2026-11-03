@@ -44,6 +44,9 @@ pub struct SchematicWatch {
     pub compile_options: Option<CompilerOptions>,
     /// If false, the file is only loaded once and changes are not picked up
     polling: bool,
+    /// If true, the file is parsed and pasted on the plot thread, blocking the plot until it's
+    /// done, instead of being parsed in the background
+    blocking: bool,
     /// The modification times of the last loaded versions of the files
     loaded_mtime: Option<WatchedTimes>,
     /// Modification times that have been seen but not loaded yet. The files are only loaded once
@@ -62,12 +65,14 @@ impl SchematicWatch {
         path: PathBuf,
         compile_options: Option<CompilerOptions>,
         polling: bool,
+        blocking: bool,
     ) -> SchematicWatch {
         let loaded_mtime = watched_times(&path);
         SchematicWatch {
             path,
             compile_options,
             polling,
+            blocking,
             loaded_mtime,
             pending_mtime: None,
             last_bounds: None,
@@ -127,11 +132,18 @@ impl Plot {
     }
 
     /// Starts parsing the watched schematic in the background. It is pasted by
-    /// `update_schematic_watch` once it has been parsed.
+    /// `update_schematic_watch` once it has been parsed. Blocking watches are parsed and pasted
+    /// right away.
     pub(super) fn reload_watched_schematic(&mut self) {
         let Some(watch) = &mut self.schematic_watch else {
             return;
         };
+        if watch.blocking {
+            let start_time = Instant::now();
+            let result = load_schematic(&watch.path);
+            self.paste_watched_schematic(result, start_time);
+            return;
+        }
         let path = watch.path.clone();
         let handle = thread::spawn(move || load_schematic(&path));
         watch.loading = Some((handle, Instant::now()));

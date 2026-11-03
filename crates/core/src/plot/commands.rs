@@ -411,14 +411,20 @@ impl Plot {
             }
             "watch" | "load" => {
                 let watching = command == "watch";
-                let usage = format!("Usage: /{} <filename> [-c [redpiler options]]", command);
+                let usage = format!(
+                    "Usage: /{} <filename> [-f] [-c [redpiler options]]",
+                    command
+                );
                 let Some(file_name) = args.first() else {
                     self.players[player].send_error_message(&usage);
                     return false;
                 };
-                let compile_options = match args.get(1) {
+                // -f loads the schematic on the plot thread, blocking the plot until it's pasted
+                let blocking = args.get(1) == Some(&"-f");
+                let option_args = &args[if blocking { 2 } else { 1 }..];
+                let compile_options = match option_args.first() {
                     None => None,
-                    Some(&"-c") => Some(CompilerOptions::parse(&args[2..].join(" "))),
+                    Some(&"-c") => Some(CompilerOptions::parse(&option_args[1..].join(" "))),
                     Some(_) => {
                         self.players[player].send_error_message(&usage);
                         return false;
@@ -434,7 +440,7 @@ impl Plot {
                     self.players[player].send_error_message("Schematic doesn't exist");
                     return false;
                 }
-                let mut watch = SchematicWatch::new(path, compile_options, watching);
+                let mut watch = SchematicWatch::new(path, compile_options, watching, blocking);
                 if !watching {
                     // Replace what the previous load or watch pasted
                     if let Some(old) = &self.schematic_watch {
