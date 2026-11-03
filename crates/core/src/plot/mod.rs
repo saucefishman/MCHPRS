@@ -28,7 +28,7 @@ use mchprs_save_data::plot_data::{ChunkData, PlotData, Tps, WorldSendRate};
 use mchprs_text::TextComponent;
 use mchprs_world::storage::Chunk;
 use mchprs_world::{TickEntry, TickPriority, World};
-use monitor::TimingsMonitor;
+use monitor::{LagEvent, TimingsMonitor};
 use scoreboard::RedpilerState;
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -37,7 +37,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use self::data::sleep_time_for_tps;
 use self::probes::PlotProbes;
@@ -313,6 +313,65 @@ impl Plot {
         }
         self.poll_world_probes();
         self.advance_clock(1);
+    }
+
+    /// What is likely to limit the plot's rtps, for lag messages and `/rtps`
+    fn rtps_limit(&self) -> String {
+        let redpiler = match self.redpiler.current_flags() {
+            Some(flags) => {
+                let letters: String = [(flags.optimize, 'o'), (flags.io_only, 'i')]
+                    .iter()
+                    .filter_map(|&(set, letter)| set.then_some(letter))
+                    .collect();
+                if letters.is_empty() {
+                    "redpiler is on".to_string()
+                } else {
+                    format!("redpiler is on (-{})", letters)
+                }
+            }
+            None => "redpiler is off".to_string(),
+        };
+        match self.last_nspt {
+            Some(nspt) if !nspt.is_zero() => format!(
+                "{}, and a tick takes {:?}, so about {} rtps fit",
+                redpiler,
+                nspt,
+                Duration::from_secs(1).as_nanos() / nspt.as_nanos()
+            ),
+            _ => redpiler,
+        }
+    }
+
+    /// Tells players and the log when the plot falls behind its target rtps or catches up again
+    fn report_lag(&mut self) {
+        for event in self.timings.drain_lag_events() {
+            let label = format!("{},{}", self.world.x, self.world.z);
+            match event {
+                LagEvent::Behind { measured, target } => {
+                    let msg = format!(
+                        "Plot {} is behind its target rtps: {} measured over 5s, target is {}. Likely limit: {}",
+                        label,
+                        measured,
+                        target,
+                        self.rtps_limit()
+                    );
+                    warn!("{}", msg);
+                    for player in &self.players {
+                        player.send_error_message(&msg);
+                    }
+                }
+                LagEvent::Recovered { measured, target } => {
+                    let msg = format!(
+                        "Plot {} is keeping up again: {} measured over 5s, target is {}",
+                        label, measured, target
+                    );
+                    info!("{}", msg);
+                    for player in &self.players {
+                        player.send_system_message(&msg);
+                    }
+                }
+            }
+        }
     }
 
     /// Send a block change to all connected players
@@ -1094,6 +1153,8 @@ impl Plot {
             {
                 self.start_redpiler(Default::default());
             }
+
+            self.report_lag();
 
             let now = Instant::now();
             let time_since_last_world_send = now - self.last_world_send_time;
