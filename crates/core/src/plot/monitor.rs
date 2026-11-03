@@ -156,7 +156,7 @@ impl TimingsMonitor {
             let mut behind_for = 0;
             // Intervals since the last "running behind" warning, while behind
             let mut since_warned: Option<u32> = None;
-            // Ticks and intervals accumulated toward the next unlimited rtps report
+            // Ticks and intervals sampled for the one-off unlimited rtps report
             let mut was_unlimited = data.tps.unlimited.load(Ordering::Relaxed);
             let mut unlimited_ticks = 0u64;
             let mut unlimited_intervals = 0u64;
@@ -211,19 +211,19 @@ impl TimingsMonitor {
                 if behind_for >= 3 {
                     data.too_slow.store(true, Ordering::Relaxed);
                     // Unlimited rtps has no target to miss, so instead log the average
-                    // rtps actually achieved every 30 seconds.
+                    // rtps actually achieved, sampled once over the first 5 seconds.
                     // Otherwise warn once, then every 30 seconds while still behind.
                     if unlimited {
-                        unlimited_ticks += ticks_passed as u64;
-                        unlimited_intervals += 1;
-                        if unlimited_intervals == 60 {
-                            info!(
-                                "Plot {} is running at {} rtps (unlimited)",
-                                label,
-                                unlimited_ticks * 2 / unlimited_intervals
-                            );
-                            unlimited_ticks = 0;
-                            unlimited_intervals = 0;
+                        if unlimited_intervals < 10 {
+                            unlimited_ticks += ticks_passed as u64;
+                            unlimited_intervals += 1;
+                            if unlimited_intervals == 10 {
+                                info!(
+                                    "Plot {} is running at {} rtps (unlimited)",
+                                    label,
+                                    unlimited_ticks * 2 / unlimited_intervals
+                                );
+                            }
                         }
                     } else {
                         match since_warned {
