@@ -26,6 +26,7 @@ pub(super) struct PlotProbes {
     file: ServerFile,
     specs: Vec<ProbeSpec>,
     clock: Option<ServerClock>,
+    levers: Vec<(String, BlockPos)>,
     /// Created when needed while redpiler isn't compiled
     poller: Option<WorldPoller>,
     hits: Vec<ProbeHit>,
@@ -44,10 +45,12 @@ impl PlotProbes {
         file.check(size, world, origin)?;
         let specs = file.specs(origin);
         let clock = file.clock(origin);
+        let levers = file.levers(origin);
         Ok(PlotProbes {
             file,
             specs,
             clock,
+            levers,
             poller: None,
             hits: Vec::new(),
             output: MessageOutput::new(Instant::now()),
@@ -141,10 +144,16 @@ impl Plot {
             return;
         }
         let pos = clock.pos();
+        self.use_lever(pos);
+    }
+
+    /// Toggles the lever at `pos` like a player using it. Returns false if it isn't a lever, which
+    /// happens if a player replaced it since the file was checked. Under redpiler, the world isn't
+    /// updated until the next flush.
+    fn use_lever(&mut self, pos: BlockPos) -> bool {
         let block = self.world.get_block(pos);
-        // A player could have replaced the lever since the file was checked
         if !matches!(block, Block::Lever { .. }) {
-            return;
+            return false;
         }
         if self.redpiler.is_active() {
             self.redpiler.on_use_block(pos);
@@ -152,6 +161,58 @@ impl Plot {
             mchprs_redstone::on_use(block, &mut self.world, pos);
             self.poll_world_probes();
         }
+        true
+    }
+
+    /// Sets a lever named in the server file, for `/lever <name> [on|off|toggle]`. `on` of `None`
+    /// toggles it. Returns the message for the player, or an error.
+    pub(super) fn set_named_lever(
+        &mut self,
+        name: &str,
+        on: Option<bool>,
+    ) -> Result<String, String> {
+        let Some(probes) = &self.probes else {
+            return Err("No server file with levers is loaded".to_string());
+        };
+        let Some(&(_, pos)) = probes.levers.iter().find(|(lever, _)| lever == name) else {
+            let names: Vec<&str> = probes
+                .levers
+                .iter()
+                .map(|(lever, _)| lever.as_str())
+                .collect();
+            return Err(if names.is_empty() {
+                "The server file has no levers".to_string()
+            } else {
+                format!("No lever named {}. Levers: {}", name, names.join(", "))
+            });
+        };
+        if probes
+            .clock
+            .as_ref()
+            .is_some_and(|clock| clock.pos() == pos)
+        {
+            return Err(format!("{} is driven by the server clock", name));
+        }
+        if self.redpiler.is_active() {
+            self.redpiler.flush(&mut self.world);
+        }
+        let Block::Lever { powered, .. } = self.world.get_block(pos) else {
+            return Err(format!("{} at {} is no longer a lever", name, pos));
+        };
+        let target = on.unwrap_or(!powered);
+        if target != powered {
+            self.use_lever(pos);
+            if self.redpiler.is_active() {
+                self.redpiler.flush(&mut self.world);
+            }
+            self.world.flush_block_changes();
+        }
+        let state = if target { "on" } else { "off" };
+        Ok(if target == powered {
+            format!("{} is already {}", name, state)
+        } else {
+            format!("Turned {} {}", name, state)
+        })
     }
 
     /// Redpiler's state replaces the world's while it's compiled, so the poller starts again

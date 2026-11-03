@@ -462,6 +462,26 @@ impl Plot {
                     );
                 }
             }
+            "lever" => {
+                let on = match args.get(1).copied() {
+                    None | Some("toggle") => None,
+                    Some("on") => Some(true),
+                    Some("off") => Some(false),
+                    Some(_) => {
+                        self.players[player]
+                            .send_error_message("Usage: /lever <name> [on|off|toggle]");
+                        return false;
+                    }
+                };
+                let (Some(name), true) = (args.first(), args.len() <= 2) else {
+                    self.players[player].send_error_message("Usage: /lever <name> [on|off|toggle]");
+                    return false;
+                };
+                match self.set_named_lever(name, on) {
+                    Ok(msg) => self.players[player].send_system_message(&msg),
+                    Err(msg) => self.players[player].send_error_message(&msg),
+                }
+            }
             "unwatch" => {
                 if self.schematic_watch.take().is_some() {
                     self.clear_probes();
@@ -747,7 +767,7 @@ pub static DECLARE_COMMANDS: LazyLock<PacketEncoder> = LazyLock::new(|| {
                 flags: CommandFlags::ROOT.bits() as i8,
                 children: vec![
                     1, 4, 5, 6, 8, 10, 11, 13, 18, 30, 34, 41, 43, 44, 45, 49, 51, 52, 53, 56, 60,
-                    63, 66,
+                    63, 66, 69,
                 ],
                 redirect_node: None,
                 name: None,
@@ -1373,6 +1393,33 @@ pub static DECLARE_COMMANDS: LazyLock<PacketEncoder> = LazyLock::new(|| {
                 redirect_node: None,
                 name: Some("options"),
                 parser: Some(Parser::String(2)),
+                suggestions_type: None,
+            },
+            // 69: /lever
+            Node {
+                flags: CommandFlags::LITERAL.bits() as i8,
+                children: vec![70],
+                redirect_node: None,
+                name: Some("lever"),
+                parser: None,
+                suggestions_type: None,
+            },
+            // 70: /lever <name>
+            Node {
+                flags: (CommandFlags::ARGUMENT | CommandFlags::EXECUTABLE).bits() as i8,
+                children: vec![71],
+                redirect_node: None,
+                name: Some("name"),
+                parser: Some(Parser::String(0)),
+                suggestions_type: None,
+            },
+            // 71: /lever <name> [on|off|toggle]
+            Node {
+                flags: (CommandFlags::ARGUMENT | CommandFlags::EXECUTABLE).bits() as i8,
+                children: vec![],
+                redirect_node: None,
+                name: Some("state"),
+                parser: Some(Parser::String(0)),
                 suggestions_type: None,
             },
         ],

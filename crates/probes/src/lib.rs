@@ -19,6 +19,16 @@ pub struct ServerFile {
     schematic_size: [u32; 3],
     probes: Vec<Probe>,
     clock: Option<Clock>,
+    #[serde(default)]
+    levers: Vec<Lever>,
+}
+
+/// An input pin that a player can set by name with `/lever`
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Lever {
+    name: String,
+    pos: [i32; 3],
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,6 +137,15 @@ pub fn parse_server_file(text: &str) -> Result<ServerFile> {
             clock.half_period_ticks >= 1,
             "clock {}: half_period_ticks must be at least 1",
             clock.pin
+        );
+    }
+    for (i, lever) in file.levers.iter().enumerate() {
+        ensure!(
+            !file.levers[..i]
+                .iter()
+                .any(|other| other.name == lever.name),
+            "lever {} is listed twice",
+            lever.name
         );
     }
     for probe in &file.probes {
@@ -292,7 +311,29 @@ impl ServerFile {
                 clock.pin
             );
         }
+        for lever in &self.levers {
+            let [x, y, z] = lever.pos;
+            ensure!(
+                inside(lever.pos, size),
+                "lever {}: {x} {y} {z} is outside the schematic",
+                lever.name
+            );
+            let block = world.get_block(world_pos(origin, lever.pos));
+            ensure!(
+                matches!(block, Block::Lever { .. }),
+                "lever {}: {x} {y} {z} is not a lever: {block:?}",
+                lever.name
+            );
+        }
         Ok(())
+    }
+
+    /// The named levers' world positions, in file order
+    pub fn levers(&self, origin: BlockPos) -> Vec<(String, BlockPos)> {
+        self.levers
+            .iter()
+            .map(|lever| (lever.name.clone(), world_pos(origin, lever.pos)))
+            .collect()
     }
 
     pub fn specs(&self, origin: BlockPos) -> Vec<ProbeSpec> {
@@ -540,6 +581,25 @@ mod tests {
         assert!(parse_server_file(&clock("1")).is_ok());
         assert!(parse_server_file(&clock("0")).is_err());
         assert!(parse_server_file(&clock("-1")).is_err());
+    }
+
+    #[test]
+    fn levers_are_named_inputs() {
+        let file = |levers: &str| {
+            format!(r#"{{"version":2,"schematic_size":[1,1,1],"probes":[],"levers":[{levers}]}}"#)
+        };
+        let rst = r#"{"name":"rst","pos":[0,0,0]}"#;
+        let parsed = parse_server_file(&file(rst)).unwrap();
+        assert_eq!(
+            parsed.levers(BlockPos::new(8, 8, 8)),
+            [("rst".to_string(), BlockPos::new(8, 8, 8))]
+        );
+        assert!(parse_server_file(&probe_file(""))
+            .unwrap()
+            .levers
+            .is_empty());
+        assert!(parse_server_file(&file(&format!("{rst},{rst}"))).is_err());
+        assert!(parse_server_file(&file(r#"{"name":"rst"}"#)).is_err());
     }
 
     #[test]

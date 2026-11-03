@@ -50,7 +50,8 @@ Outputs are read from repeaters, comparators, dust, torches and lamps.
     "enable": {"pos": [4, 2, 3]},
     "data": [{"pos": [5, 2, 3]}, {"pos": [6, 2, 3]}, {"const": 0}]
   }],
-  "clock": {"pin": "clk", "pos": [0, 2, 0], "half_period_ticks": 4}
+  "clock": {"pin": "clk", "pos": [0, 2, 0], "half_period_ticks": 4},
+  "levers": [{"name": "rst", "pos": [2, 2, 0]}]
 }
 ```
 
@@ -81,6 +82,11 @@ lever keeps its pasted state until the first toggle, `half_period_ticks` after t
 paste it off to make that a rising edge. The clock follows `/rtps`, and doesn't run while the plot
 has no players. `pin` is only used in messages. A lever under redpiler is kept through optimization
 even if it drives nothing.
+
+`levers` is optional: a list of `{"name": "rst", "pos": [x, y, z]}`, each a lever in the
+schematic, or the file is rejected. Names must be unique. In game, `/lever <name> [on|off|toggle]`
+sets one like a player using it, toggling by default. The clock's lever is refused while the clock
+runs. The test command doesn't use `levers`; scripts name pins from the pins file instead.
 
 The test command ignores the clock unless you pass `--run-clock`, so scripts that use `pulse` keep
 their tick counts.
