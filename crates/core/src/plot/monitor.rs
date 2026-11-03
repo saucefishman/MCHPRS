@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use tracing::warn;
+use tracing::{info, warn};
 
 #[derive(Default)]
 struct AtomicTps {
@@ -62,7 +62,8 @@ pub struct TimingsMonitor {
 }
 
 impl TimingsMonitor {
-    pub fn new(tps: Tps) -> TimingsMonitor {
+    /// `label` identifies the plot in log messages.
+    pub fn new(tps: Tps, label: String) -> TimingsMonitor {
         let data = Arc::new(MonitorData {
             ticks_passed: Default::default(),
             reset_timings: Default::default(),
@@ -72,7 +73,7 @@ impl TimingsMonitor {
             timings_record: Default::default(),
             tps: AtomicTps::from_tps(tps),
         });
-        let monitor_thread = Some(Self::run_thread(data.clone()));
+        let monitor_thread = Some(Self::run_thread(data.clone(), label));
         TimingsMonitor {
             data,
             monitor_thread,
@@ -146,13 +147,19 @@ impl TimingsMonitor {
         self.data.reset_timings.store(4, Ordering::Relaxed);
     }
 
-    fn run_thread(data: Arc<MonitorData>) -> JoinHandle<()> {
+    fn run_thread(data: Arc<MonitorData>, label: String) -> JoinHandle<()> {
         thread::spawn(move || {
             let mut last_tps = data.tps.tps.load(Ordering::Relaxed);
             let mut last_ticks_count = data.ticks_passed.load(Ordering::Relaxed);
             let mut was_ticking_before = data.ticking.load(Ordering::Relaxed);
 
             let mut behind_for = 0;
+            // Intervals since the last "running behind" warning, while behind
+            let mut since_warned: Option<u32> = None;
+            // Ticks and intervals accumulated toward the next unlimited rtps report
+            let mut was_unlimited = data.tps.unlimited.load(Ordering::Relaxed);
+            let mut unlimited_ticks = 0u64;
+            let mut unlimited_intervals = 0u64;
             loop {
                 thread::sleep(Duration::from_millis(500));
                 if !data.running.load(Ordering::Relaxed) {
@@ -172,27 +179,66 @@ impl TimingsMonitor {
                     || tps != last_tps
                     || data.reset_timings.load(Ordering::Relaxed) > 0
                 {
-                    data.reset_timings.fetch_sub(1, Ordering::Relaxed);
+                    let _ = data.reset_timings.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |n| n.checked_sub(1),
+                    );
                     was_ticking_before = ticking;
                     last_tps = tps;
                     continue;
                 }
 
+                let unlimited = data.tps.unlimited.load(Ordering::Relaxed);
                 // 5% threshold
-                if data.tps.unlimited.load(Ordering::Relaxed) || ticks_passed < (tps / 2) * 95 / 100
-                {
+                if unlimited || ticks_passed < (tps / 2) * 95 / 100 {
                     behind_for += 1;
                 } else {
                     behind_for = 0;
                     data.too_slow.store(false, Ordering::Relaxed);
+                    if since_warned.take().is_some() {
+                        info!("Plot {} is meeting its target of {} rtps again", label, tps);
+                    }
+                }
+
+                if unlimited != was_unlimited {
+                    was_unlimited = unlimited;
+                    since_warned = None;
+                    unlimited_ticks = 0;
+                    unlimited_intervals = 0;
                 }
 
                 if behind_for >= 3 {
                     data.too_slow.store(true, Ordering::Relaxed);
-                    // warn!(
-                    //     "running behind by {} ticks",
-                    //     ((tps / 2) * 95 / 100) - ticks_passed
-                    // );
+                    // Unlimited rtps has no target to miss, so instead log the average
+                    // rtps actually achieved every 30 seconds.
+                    // Otherwise warn once, then every 30 seconds while still behind.
+                    if unlimited {
+                        unlimited_ticks += ticks_passed as u64;
+                        unlimited_intervals += 1;
+                        if unlimited_intervals == 60 {
+                            info!(
+                                "Plot {} is running at {} rtps (unlimited)",
+                                label,
+                                unlimited_ticks * 2 / unlimited_intervals
+                            );
+                            unlimited_ticks = 0;
+                            unlimited_intervals = 0;
+                        }
+                    } else {
+                        match since_warned {
+                            Some(n) if n < 60 => since_warned = Some(n + 1),
+                            _ => {
+                                warn!(
+                                    "Plot {} is not meeting its target rtps: running at {} rtps, target is {}",
+                                    label,
+                                    ticks_passed * 2,
+                                    tps
+                                );
+                                since_warned = Some(1);
+                            }
+                        }
+                    }
                 }
 
                 // The timings record will only go back 15 minutes.

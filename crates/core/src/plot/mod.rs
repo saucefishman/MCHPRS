@@ -1204,7 +1204,7 @@ impl Plot {
             world_send_rate,
             always_running,
             redpiler: Default::default(),
-            timings: TimingsMonitor::new(tps),
+            timings: TimingsMonitor::new(tps, format!("{},{}", x, z)),
             owner: database::get_plot_owner(x, z).map(|s| s.parse::<HyphenatedUUID>().unwrap().0),
             async_rt: Plot::create_async_rt(),
             scoreboard: Default::default(),
