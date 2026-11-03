@@ -342,7 +342,8 @@ impl Plot {
         }
     }
 
-    /// Tells players and the log when the plot falls behind its target rtps or catches up again
+    /// Logs when the plot falls behind its target rtps or catches up again. Players can see the
+    /// same numbers with `/rtps`.
     fn report_lag(&mut self) {
         for event in self.timings.drain_lag_events() {
             let label = format!("{},{}", self.world.x, self.world.z);
@@ -356,9 +357,6 @@ impl Plot {
                         self.rtps_limit()
                     );
                     warn!("{}", msg);
-                    for player in &self.players {
-                        player.send_error_message(&msg);
-                    }
                 }
                 LagEvent::Recovered { measured, target } => {
                     let msg = format!(
@@ -366,9 +364,6 @@ impl Plot {
                         label, measured, target
                     );
                     info!("{}", msg);
-                    for player in &self.players {
-                        player.send_system_message(&msg);
-                    }
                 }
             }
         }
