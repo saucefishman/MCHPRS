@@ -4,15 +4,65 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Discord Banner 2](https://discordapp.com/api/guilds/724072903083163679/widget.png)](https://discord.com/invite/svK9JU7)
 
-A Minecraft 1.20.4 creative server built for redstone. Each 512x512 plot runs on a separate thread, allowing for less lag, more concurrency, and many awesome extra features!
+A Minecraft 1.20.4 creative server built for redstone. Each plot runs on a separate thread, allowing for less lag, more concurrency, and many awesome extra features!
 
 MCHPRS is very different from traditional servers. Because this server is tailored to the use of computation redstone, many things that are a part of Vanilla Minecraft servers don't exist here. That being said, MCHPRS comes with many of its own unique features.
 
 MCHPRS has made it possible to run programs such as [a limited form of Minecraft](https://www.youtube.com/watch?v=-BP7DhHTU-I) on CPUs in Minecraft. To accomplish these speeds, we created [Redpiler](docs/Redpiler.md), the "Redstone Compiler".
 
+## This fork, for MineRTL
+
+This fork of [MCHPRS](https://github.com/MCHPR/MCHPRS) runs builds from [MineRTL](https://github.com/saucefishman/MineRTL), which compiles Verilog to redstone. Over upstream it adds:
+
+- Loading a build together with the `<name>.server.json` MineRTL writes next to its `.litematic`, which drives a server clock, prints `$display`/`$write` output and names input levers.
+- `mchprs_headless`, which runs a schematic from a script without a server or game, for tests.
+- Litematic loading, larger plots (1024x1024, 384 blocks tall), and `/setblock` and `/fill` for Litematica's printer.
+
+### Setup
+
+```shell
+git clone https://github.com/saucefishman/MCHPRS.git
+cd MCHPRS
+cargo build --release
+cargo build --release -p mchprs_headless
+./target/release/mchprs
+```
+
+MineRTL finds `mchprs_headless` at `$MCHPRS_HEADLESS`, else `$MCHPRS_DIR/target/release/mchprs_headless`, else `mchprs_headless` on `PATH`. Connect with a 1.20.4 client.
+
+### Loading a build
+
+Copy `<name>.litematic` and `<name>.server.json` into `schems/`, stand on a plot and run `/load <name>.litematic -c`. This pastes the build on the plot floor, loads the server file and compiles redpiler. WorldEdit's `//load` and `//paste` paste the blocks only, without the server file, so there's no clock, debug output or `/lever`.
+
+Plots only tick while a player is on them, so stay on the plot while it runs.
+
+### Commands
+
+| Command | Description |
+| --- | --- |
+| `/load <file> [-f] [-c [flags]]` | Paste a schematic and its server file once. `-c` compiles redpiler with the given flags, such as `-c -oi`. `-f` loads it in one step, pausing the plot. |
+| `/watch <file> [-f] [-c [flags]]` | Like `/load`, and pastes again whenever the schematic or server file changes. |
+| `/unwatch` | Stop watching. |
+| `/lever <name> [on\|off\|toggle]` | Set an input lever named in the server file, such as `/lever rst on`. Toggles by default. |
+| `/rtps halfclock [on\|off]` | With redpiler and a server clock, run each half clock period at once with one world update. Much faster on large builds. |
+| `/rtps` | Measured rtps over 5s to 15m against the target, and what limits it. Sustained lag below 90% of the target is logged. |
+| `/plot clear [confirm]` | Clear the plot. |
+| `/setblock`, `/fill` | Vanilla-style block commands, for Litematica's printer. |
+
+The server clock toggles the clock lever every `half_period_ticks` from the server file, following `/rtps`. Debug output prints in chat and the server log as it happens.
+
+### mchprs_headless
+
+```shell
+mchprs_headless test <schem> <pins.txt> <script.txt> [--modes redstone,redpiler] [--probes <name>.server.json] [--run-clock] [--add-lever NAME]...
+```
+
+Scripts use `settle <ticks>`, `set <pin> 0|1`, `pulse <pin> <ticks>`, `expect <pin> 0|1` and `print <label>`. `--probes` prints debug output, `--run-clock` runs the server clock, and `--add-lever` places a lever on a pin. See [crates/headless/README.md](crates/headless/README.md) for the file formats and the `settle` command.
+
 ## Table of Contents
 
 - [Table of Contents](#table-of-contents)
+- [This fork, for MineRTL](#this-fork-for-minertl)
 - [Building](#building)
 - [Configuration](#configuration)
     - [LuckPerms](#luckperms)
